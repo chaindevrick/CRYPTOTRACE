@@ -3,14 +3,14 @@ package usecase
 import (
 	"backend/internal/domain"
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
-	"fmt"
 )
 
 type analyzerUsecase struct {
-	BaseUsecase // 繼承 BaseUsecase 的所有屬性與方法
+	BaseUsecase
 }
 
 func NewAnalyzerUsecase(base BaseUsecase) domain.AnalyzerUsecase {
@@ -19,99 +19,130 @@ func NewAnalyzerUsecase(base BaseUsecase) domain.AnalyzerUsecase {
 
 func (uc *analyzerUsecase) Analyze(ctx context.Context, targetAddress string) (int, error) {
 	targetAddress = strings.ToLower(targetAddress)
-	
-	// BFS 追蹤紀錄
-	visited := make(map[string]bool)
-	queue := []string{targetAddress}
-	
+
 	// === 🕸️ 局部網路 (Ego-network) 爬蟲參數設定 ===
 	maxDepth := 3           // 往外擴展的層數 (Hop 1 ~ Hop 3)
-	maxTxPerAddress := 50   // 每個節點最多抓取前 50 筆最新交易 (避免單一節點耗盡資源)
-	maxNodesPerDepth := 20  // 每一層最多只延伸探索 20 個新錢包 (防止指數型節點爆炸)
+	maxTxPerAddress := 50   // 每個節點最多抓取前 50 筆最新交易
+	maxNodesPerDepth := 20  // 每一層最多只延伸探索 20 個新錢包
 	// =============================================
 
-	totalSaved := 0
+	// ==========================================
+	// 🚀 STEP 1: 【同步執行】只抓第 0 層 (目標本身)
+	// ==========================================
+	txs, err := uc.EtherscanRepo.GetTokenTxs(ctx, targetAddress, "desc")
+	if err != nil {
+		return 0, err
+	}
 
-	fmt.Printf("🔍 [Crawler] 開始建立 %s 的 %d 層自我中心網路 (Ego-Network)...\n", targetAddress, maxDepth)
+	limit := maxTxPerAddress
+	if len(txs) < limit { limit = len(txs) }
 
-	// 開始廣度優先搜尋 (BFS)
-	for depth := 0; depth <= maxDepth; depth++ {
-		var nextQueue []string
-		nodesExploredInThisDepth := 0
-		
-		fmt.Printf("📂 [Crawler] 正在探索第 %d 層，共有 %d 個候選節點\n", depth, len(queue))
+	count := 0
+	visited := make(map[string]bool)
+	visited[targetAddress] = true
+	var hop1Queue []string // 準備交給背景的第 1 層名單
 
-		for _, addr := range queue {
-			if visited[addr] {
-				continue
-			}
-			visited[addr] = true
-			nodesExploredInThisDepth++
-			
-			// 向 Etherscan 請求該節點的交易紀錄
-			txs, err := uc.EtherscanRepo.GetTokenTxs(ctx, addr, "desc")
-			if err != nil {
-				continue // 若發生錯誤或查無資料，跳過該節點
-			}
+	for _, tx := range txs[:limit] {
+		tokenName, exists := uc.Contracts[strings.ToLower(tx.ContractAddress)]
+		if !exists { continue }
 
-			limit := maxTxPerAddress
-			if len(txs) < limit {
-				limit = len(txs)
-			}
+		amount := uc.FormatAmount(tx.Value)
+		if amount <= 0 { continue }
 
-			// 處理該節點的每一筆交易
-			for _, tx := range txs[:limit] {
-				tokenName, exists := uc.Contracts[strings.ToLower(tx.ContractAddress)]
-				if !exists { continue }
+		timestamp, _ := strconv.ParseInt(tx.TimeStamp, 10, 64)
+		from := strings.ToLower(tx.From)
+		to := strings.ToLower(tx.To)
 
-				amount := uc.FormatAmount(tx.Value)
-				if amount <= 0 { continue }
-
-				timestamp, _ := strconv.ParseInt(tx.TimeStamp, 10, 64)
-				from := strings.ToLower(tx.From)
-				to := strings.ToLower(tx.To)
-
-				// 寫入資料庫
-				if err := uc.TxRepo.UpsertTx(ctx, from, to, tx.Hash, tokenName, "TRANSFER", amount, timestamp); err == nil {
-					totalSaved++
-				}
-
-				// 如果還沒達到最外層，將交易的另一方加入下一層的探索清單
-				if depth < maxDepth {
-					// 找出交易中的「對手方 (Counterparty)」，並確保未探索過
-					if from != addr && !visited[from] {
-						nextQueue = append(nextQueue, from)
-					}
-					if to != addr && !visited[to] {
-						nextQueue = append(nextQueue, to)
-					}
-				}
-			}
-			
-			// 避免當層無限擴散，達到採樣上限即中斷該層探索
-			if nodesExploredInThisDepth >= maxNodesPerDepth {
-				break 
-			}
-			
-			// 🛡️ Etherscan API Rate Limit 保護 (免費版通常限制 5 req/sec)
-			time.Sleep(250 * time.Millisecond) 
+		if err := uc.TxRepo.UpsertTx(ctx, from, to, tx.Hash, tokenName, "TRANSFER", amount, timestamp); err == nil {
+			count++
 		}
-		
-		// 將下一層的節點設為下一輪的 queue
-		queue = nextQueue
+
+		// 收集下一層名單
+		if from != targetAddress && !visited[from] {
+			hop1Queue = append(hop1Queue, from)
+			visited[from] = true
+		}
+		if to != targetAddress && !visited[to] {
+			hop1Queue = append(hop1Queue, to)
+			visited[to] = true
+		}
 	}
 
-	fmt.Printf("✅ [Crawler] 網路建立完成！共儲存 %d 筆關聯交易作為基準數據。\n", totalSaved)
+	fmt.Printf("🎯 [Crawler] 第 0 層 (目標錢包) 建立完成，找到 %d 筆交易。準備秒回前端！\n", count)
 
-	// 當全部層級的生態系資料都建立完畢後，觸發 Python 的孤立森林 AI 分析
-	if totalSaved > 0 {
-		go func() {
-			// 因為抓取的資料量變大，AI 分析的時間可能會變長，將 Timeout 延長至 30 秒
-			bgCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second) 
-			defer cancel()
+	// ==========================================
+	// 🚀 STEP 2: 【非同步執行】深層爬蟲 (Hop 1~3) 與 AI
+	// ==========================================
+	if count > 0 && maxDepth > 0 {
+		// ⚠️ 建立全新的 Context，因為原本的 ctx 會隨著 HTTP 回應結束而被註銷
+		bgCtx, _ := context.WithTimeout(context.Background(), 5*time.Minute)
+
+		go func(startingQueue []string, currentVisited map[string]bool) {
+			queue := startingQueue
+			totalBackgroundSaved := 0
+
+			fmt.Printf("🔍 [Crawler] 開始在背景擴展 %s 的深層自我中心網路...\n", targetAddress)
+
+			// 從第 1 層開始繼續 BFS
+			for depth := 1; depth <= maxDepth; depth++ {
+				var nextQueue []string
+				nodesExplored := 0
+
+				fmt.Printf("📂 [Crawler] 正在探索第 %d 層，共有 %d 個候選節點\n", depth, len(queue))
+
+				for _, addr := range queue {
+					nodesExplored++
+
+					bgTxs, err := uc.EtherscanRepo.GetTokenTxs(bgCtx, addr, "desc")
+					if err != nil { continue }
+
+					bgLimit := maxTxPerAddress
+					if len(bgTxs) < bgLimit { bgLimit = len(bgTxs) }
+
+					for _, tx := range bgTxs[:bgLimit] {
+						tokenName, exists := uc.Contracts[strings.ToLower(tx.ContractAddress)]
+						if !exists { continue }
+
+						amount := uc.FormatAmount(tx.Value)
+						if amount <= 0 { continue }
+
+						timestamp, _ := strconv.ParseInt(tx.TimeStamp, 10, 64)
+						from := strings.ToLower(tx.From)
+						to := strings.ToLower(tx.To)
+
+						if err := uc.TxRepo.UpsertTx(bgCtx, from, to, tx.Hash, tokenName, "TRANSFER", amount, timestamp); err == nil {
+							totalBackgroundSaved++
+						}
+
+						// 繼續往下收集
+						if depth < maxDepth {
+							if !currentVisited[from] {
+								nextQueue = append(nextQueue, from)
+								currentVisited[from] = true
+							}
+							if !currentVisited[to] {
+								nextQueue = append(nextQueue, to)
+								currentVisited[to] = true
+							}
+						}
+					}
+
+					if nodesExplored >= maxNodesPerDepth { break }
+					time.Sleep(250 * time.Millisecond) // Rate Limit
+				}
+				queue = nextQueue
+			}
+
+			fmt.Printf("✅ [Crawler] 深層網路建立完成！背景共儲存 %d 筆關聯交易。準備觸發 AI...\n", totalBackgroundSaved)
+
+			// 觸發 Python AI
 			_ = uc.AIRepo.TriggerAnalysis(bgCtx, targetAddress)
-		}()
+
+		}(hop1Queue, visited) // 將參數複製傳入 Goroutine
 	}
 
-	return totalSaved, nil
+	// ==========================================
+	// 🚀 STEP 3: 立即回傳第 0 層的數據給前端
+	// ==========================================
+	return count, nil
 }

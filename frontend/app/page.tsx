@@ -22,6 +22,7 @@ export default function ForensicsDashboard() {
   const [mode, setMode] = useState<'overview' | 'trace'>('overview');
   const [stats, setStats] = useState<AnalysisStats>({ riskScore: 0, nodeCount: 0, mode: 'overview' });
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [syncState, setSyncState] = useState<'syncing' | 'synced'>('synced'); // LIVE SYNC 狀態
 
   const cyRef = useRef<HTMLDivElement>(null);
   const cyInstance = useRef<Core | null>(null);
@@ -32,12 +33,46 @@ export default function ForensicsDashboard() {
     return 'text-[#00FF9D] drop-shadow-[0_0_12px_rgba(0,255,157,0.4)]';
   };
 
+  // ✨ 風險與節點計算函數
+  const calculateRiskAndNodes = (graphData: GraphElement[], currentMode: string) => {
+    let calculatedRisk = 0;
+    const uniqueNodes = new Set();
+
+    graphData.forEach((element) => {
+      if (!('source' in element.data)) {
+        const node = element as GraphNode;
+        uniqueNodes.add(node.data.id);
+        const isTarget = node.data.isTarget;
+        const nodeType = node.data.type;
+
+        if (nodeType === 'HighRisk' || nodeType === 'Mixer') {
+          if (isTarget) {
+            calculatedRisk += 75;
+          } else {
+            calculatedRisk += 15;
+          }
+        }
+      } else {
+        const edge = element as GraphEdge;
+        if (edge.data.type === 'Trace') calculatedRisk += 5;
+      }
+    });
+
+    calculatedRisk = Math.min(100, Math.max(0, calculatedRisk));
+    if (calculatedRisk === 0) {
+      calculatedRisk = currentMode === 'trace' ? 12 : 5; 
+    }
+
+    return { calculatedRisk, nodeCount: uniqueNodes.size };
+  };
+
   const handleAnalysis = async () => {
     if (!targetAddress) return;
     
     setAnalyzing(true);
     setHasGraphData(false);
     setErrorMsg(null);
+    setSyncState('syncing'); // 開始同步
     
     if (cyInstance.current) {
       cyInstance.current.destroy();
@@ -56,49 +91,11 @@ export default function ForensicsDashboard() {
         return;
       }
 
-      // ✨ 核心升級：動態風險評估引擎 (Dynamic Risk Scoring) 且具備嚴格型別安全
-      let calculatedRisk = 0;
-      const uniqueNodes = new Set();
-
-      graphData.forEach((element) => {
-        // ✨ TypeScript 類型保護 (Type Guard)：用 'source' 來分辨 Node 還是 Edge
-        if (!('source' in element.data)) {
-          // 這是一顆 Node (安全轉型)
-          const node = element as GraphNode;
-          uniqueNodes.add(node.data.id);
-          
-          const isTarget = node.data.isTarget;
-          const nodeType = node.data.type;
-
-          // 規則 A：如果有關聯的節點是高風險或混幣器
-          if (nodeType === 'HighRisk' || nodeType === 'Mixer') {
-            if (isTarget) {
-              calculatedRisk += 75; // 目標本身是危險的，直接 +75 分
-            } else {
-              calculatedRisk += 15; // 關聯節點是危險的，每個 +15 分
-            }
-          }
-        } else {
-          // 這是一條 Edge (安全轉型)
-          const edge = element as GraphEdge;
-          // 規則 B：如果是被 Trace 演算法抓出來的精準連線
-          if (edge.data.type === 'Trace') {
-            calculatedRisk += 5; // 每多一層洗錢轉移，+5 分
-          }
-        }
-      });
-
-      // 規則 C：確保分數在 0 到 100 之間
-      calculatedRisk = Math.min(100, Math.max(0, calculatedRisk));
-      
-      // 給予基礎基準分
-      if (calculatedRisk === 0) {
-        calculatedRisk = mode === 'trace' ? 12 : 5; 
-      }
+      const { calculatedRisk, nodeCount } = calculateRiskAndNodes(graphData, mode);
 
       setStats({
-        nodeCount: uniqueNodes.size, // 精準計算節點數量 (不包含連線)
-        riskScore: calculatedRisk,   // 帶入動態計算的風險分數
+        nodeCount: nodeCount, 
+        riskScore: calculatedRisk,   
         mode: mode
       });
 
@@ -112,6 +109,46 @@ export default function ForensicsDashboard() {
       setAnalyzing(false);
     }
   };
+
+  // ✨ 自動輪詢背景進度 (Live Sync)
+  useEffect(() => {
+    let intervalId: NodeJS.Timeout;
+    let unchangedCount = 0; // 記錄有幾次沒發現新節點
+
+    if (hasGraphData && mode === 'overview' && targetAddress && syncState === 'syncing') {
+      intervalId = setInterval(async () => {
+        try {
+          const response = await axios.get<GraphElement[]>(`/api/graph/${targetAddress}`);
+          const graphData = response.data;
+
+          if (graphData && graphData.length > 0) {
+            const { calculatedRisk, nodeCount } = calculateRiskAndNodes(graphData, mode);
+
+            setStats(prev => {
+              // 只有當發現新節點或風險分數改變時，才更新畫面
+              if (prev.nodeCount !== nodeCount || prev.riskScore !== calculatedRisk) {
+                unchangedCount = 0; // 有新進度，重置計數
+                setTimeout(() => renderGraph(graphData), 100);
+                return { ...prev, nodeCount: nodeCount, riskScore: calculatedRisk };
+              } else {
+                unchangedCount += 1; // 沒新進度，累積次數
+                if (unchangedCount >= 3) {
+                  setSyncState('synced'); // 連續三次沒進度，視為同步完成
+                }
+                return prev;
+              }
+            });
+          }
+        } catch (error) {
+          console.error('Live sync error:', error);
+        }
+      }, 8000); // 每 8 秒偷抓一次
+    }
+
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [hasGraphData, mode, targetAddress, syncState]);
 
   const renderGraph = (elements: GraphElement[]) => {
     if (!cyRef.current) return;
@@ -142,7 +179,6 @@ export default function ForensicsDashboard() {
           }
         },
         {
-          // 目標節點 (使用 isTarget 判斷)
           selector: 'node[?isTarget]',
           style: {
             'background-color': '#000',
@@ -158,7 +194,6 @@ export default function ForensicsDashboard() {
           }
         },
         {
-          // 實名已知交易所 / 混幣器
           selector: 'node[type="Mixer"], node[type="risk"]',
           style: {
             'background-color': '#1A0505',
@@ -173,7 +208,6 @@ export default function ForensicsDashboard() {
           }
         },
         {
-          // AI 標記的高風險錢包
           selector: 'node[type="HighRisk"]',
           style: {
             'background-color': '#3a0000',
@@ -236,7 +270,7 @@ export default function ForensicsDashboard() {
             animate: true,
             animationDuration: 800,
             concentric: (node: any) => {
-              if (node.data('isTarget')) return 100; // 目標在最內圈
+              if (node.data('isTarget')) return 100;
               if (node.data('type') === 'HighRisk' || node.data('type') === 'Mixer') return 80;
               return 10;
             },
@@ -244,7 +278,6 @@ export default function ForensicsDashboard() {
           }) as any
     });
 
-    // ✨ 點擊事件：點擊任意節點，自動將完整地址填入搜尋框
     cyInstance.current.on('tap', 'node', function(evt) {
       const node = evt.target;
       setTargetAddress(node.id());
@@ -323,7 +356,15 @@ export default function ForensicsDashboard() {
         <div className="absolute top-8 right-8 z-20 w-[280px]">
           <div className="bg-[#121216]/80 backdrop-blur-xl border border-white/10 rounded-xl overflow-hidden shadow-2xl">
             <div className="bg-white/5 px-5 py-3 border-b border-white/5 flex items-center justify-between">
-              <span className="text-[10px] tracking-[0.15em] font-bold text-slate-400 uppercase">Intelligence</span>
+              <span className="text-[10px] tracking-[0.15em] font-bold text-slate-400 uppercase flex items-center gap-2">
+                Intelligence
+                {mode === 'overview' && syncState === 'syncing' && (
+                  <span className="text-[#00E0FF] tracking-widest text-[8px] animate-pulse">(LIVE SYNC)</span>
+                )}
+                {mode === 'overview' && syncState === 'synced' && (
+                  <span className="text-[#00FF9D] tracking-widest text-[8px]">(SYNCED)</span>
+                )}
+              </span>
               <div className="flex h-2 w-2 relative">
                 <span className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${stats.mode === 'trace' ? 'bg-[#FF003C]' : 'bg-[#00E0FF]'}`}></span>
                 <span className={`relative inline-flex rounded-full h-2 w-2 ${stats.mode === 'trace' ? 'bg-[#FF003C]' : 'bg-[#00E0FF]'}`}></span>
@@ -331,7 +372,7 @@ export default function ForensicsDashboard() {
             </div>
             
             <div className="p-8 text-center border-b border-white/5">
-              <div className={`text-6xl font-bold font-mono tracking-tighter ${getRiskColor(stats.riskScore)}`}>
+              <div className={`text-6xl font-bold font-mono tracking-tighter transition-colors duration-1000 ${getRiskColor(stats.riskScore)}`}>
                 {stats.riskScore}
               </div>
               <div className="text-[10px] tracking-widest text-slate-500 mt-3 uppercase">Computed Risk Score</div>
@@ -340,7 +381,7 @@ export default function ForensicsDashboard() {
             <div className="grid grid-cols-2 divide-x divide-white/5">
               <div className="p-5 flex flex-col items-center">
                 <span className="text-[10px] tracking-widest text-slate-500 uppercase mb-2">Entities</span>
-                <span className="font-mono text-lg font-medium text-white">{stats.nodeCount}</span>
+                <span className="font-mono text-lg font-medium text-white transition-all">{stats.nodeCount}</span>
               </div>
               <div className="p-5 flex flex-col items-center">
                 <span className="text-[10px] tracking-widest text-slate-500 uppercase mb-2">Vector</span>
