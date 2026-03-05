@@ -62,7 +62,6 @@ def analyze():
     """
 
     df = pd.read_sql(query, conn, params=(target_address,))
-    df = pd.read_sql(query, conn, params=(target_address, target_address))
 
     if df.empty or len(df) < 5:
         print(f"⚠️ [AI Engine] 資料量不足 ({len(df)} 筆)，跳過機器學習分析。", flush=True)

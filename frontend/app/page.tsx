@@ -5,7 +5,6 @@ import axios from 'axios';
 import cytoscape, { Core } from 'cytoscape';
 import dagre from 'cytoscape-dagre';
 import { Search, Activity, Share2, Target, ShieldAlert, Layers } from 'lucide-react';
-// ✨ 確保引入了 GraphNode 和 GraphEdge
 import { GraphElement, GraphNode, GraphEdge, AnalysisStats } from '@/types';
 
 if (typeof window !== 'undefined') {
