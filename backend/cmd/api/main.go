@@ -27,7 +27,7 @@ func main() {
 		Port:     "5432",     // 本地端通常為 5432，Cloud Run Socket 可留空
 		User:     "postgres",     // 例如: postgres
 		Password: os.Getenv("DB_PASSWORD"), // 你的密碼
-		DBName:   "cryptotrace-pgdb",     // 例如: cryptotrace
+		DBName:   "cryptotrace",     // 例如: cryptotrace
 		SSLMode:  "disable",
 	}
 
