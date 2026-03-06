@@ -1,123 +1,175 @@
 package postgres
 
 import (
-	"backend/internal/domain"
 	"context"
 	"database/sql"
 	"fmt"
 	"time"
+
+	"backend/internal/domain"
 )
+
+// =====================================================================
+// Repository Layer: Transaction & Graph Persistence
+// Design Decision: 實作 domain.TransactionRepository。
+// Why: 將複雜的 SQL 語法、遞迴查詢 (CTE) 與資料列映射 (Row Scanning) 
+//      完全封裝於此。業務邏輯層 (Usecase) 只需要呼叫 GetGraph()，
+//      完全不需要知道底層是怎麼撈出這 250 條連線的。
+// =====================================================================
 
 type txRepository struct {
 	db *sql.DB
 }
 
-// 依賴注入 (DI)：透過建構子把 db 塞進來
+// NewTransactionRepository 透過依賴注入 (DI) 接收連線池
 func NewTransactionRepository(db *sql.DB) domain.TransactionRepository {
 	return &txRepository{db: db}
 }
 
+// =====================================================================
+// [Method] UpsertTx: 冪等性寫入交易與錢包節點
+// Design Decision: 引入 SQL Transaction (tx.ExecContext) 保證 ACID 特性。
+// Why: 區塊鏈資料具有高度關聯性。如果「發送方錢包」寫入成功，但「交易紀錄」
+//      寫入失敗，資料庫就會出現髒資料。使用 Transaction 確保這三個 Insert
+//      動作具備原子性 (Atomicity)。
+// =====================================================================
 func (r *txRepository) UpsertTx(ctx context.Context, from, to, hash, token, txType string, amount float64, timestamp int64) error {
-	// 這裡我們暫時將 label 預設為 wallet，真正的標籤解析會由 Usecase 層指揮
-	walletQuery := `
-		INSERT INTO wallets (address, label) VALUES ($1, 'wallet')
-		ON CONFLICT (address) DO NOTHING
-	`
-	r.db.ExecContext(ctx, walletQuery, from)
-	r.db.ExecContext(ctx, walletQuery, to)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("開啟資料庫交易失敗: %w", err)
+	}
+	// 防禦性設計：確保中途出錯時能回滾 (Rollback)
+	defer tx.Rollback()
 
+	// 1. 確保錢包節點存在 (ON CONFLICT DO NOTHING)
+	walletQuery := `
+        INSERT INTO wallets (address, label) VALUES ($1, 'wallet')
+        ON CONFLICT (address) DO NOTHING
+    `
+	if _, err := tx.ExecContext(ctx, walletQuery, from); err != nil {
+		return fmt.Errorf("寫入發送方錢包失敗: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, walletQuery, to); err != nil {
+		return fmt.Errorf("寫入接收方錢包失敗: %w", err)
+	}
+
+	// 2. 寫入交易邊 (Edge)，若重複則更新其狀態 (如升級為 Trace 模式)
 	txQuery := `
-		INSERT INTO transactions (hash, from_address, to_address, amount, token, timestamp, type)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (hash, from_address, to_address, token) 
-		DO UPDATE SET type = EXCLUDED.type
-	`
-	_, err := r.db.ExecContext(ctx, txQuery, hash, from, to, amount, token, timestamp, txType)
-	return err
+        INSERT INTO transactions (hash, from_address, to_address, amount, token, timestamp, type)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (hash, from_address, to_address, token) 
+        DO UPDATE SET type = EXCLUDED.type
+    `
+	if _, err := tx.ExecContext(ctx, txQuery, hash, from, to, amount, token, timestamp, txType); err != nil {
+		return fmt.Errorf("寫入交易紀錄失敗: %w", err)
+	}
+
+	// 3. 全部成功，提交交易
+	return tx.Commit()
 }
 
+// =====================================================================
+// [Method] ResolveLabel: 情報實體解析
+// =====================================================================
 func (r *txRepository) ResolveLabel(ctx context.Context, address string) string {
-	// 從 DB 獲取目前的標籤
 	var label string
 	err := r.db.QueryRowContext(ctx, "SELECT label FROM wallets WHERE address = $1", address).Scan(&label)
 	if err != nil {
+		// 查無資料時，優雅降級回傳預設值
 		return "wallet"
 	}
 	return label
 }
 
+
+
+// =====================================================================
+// [Method] GetGraph: 核心圖論引擎 (Graph Engine)
+// Design Decision: 捨棄 ORM，採用原生 Raw SQL 與 Recursive CTE。
+// Why: ORM (如 GORM) 無法有效編譯複雜的遞迴查詢。為了壓榨 PostgreSQL 
+//      的圖論遍歷效能，直接編寫最佳化的 CTE 是唯一且最專業的解法。
+// =====================================================================
 func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool) ([]domain.CytoElement, error) {
 	var query string
 	var args []interface{}
 
 	if isTxHash {
 		// ==========================================
-		// 🎯 FLOW 模式：精準溯源一條直線
+		// 🎯 FLOW 模式：線性時間序列追蹤
+		// Design Decision: 利用遞迴 CTE 結合時間戳 (timestamp >= p.timestamp) 
+		// 防止時空錯亂的髒款回流，確保資金流向的邏輯正確性。
 		// ==========================================
 		query = `
-			WITH RECURSIVE trace_path AS (
-				SELECT hash, from_address, to_address, amount, timestamp, token, type
-				FROM transactions 
-				WHERE hash = $1 AND type = 'Trace'
-				
-				UNION
-				
-				SELECT t.hash, t.from_address, t.to_address, t.amount, t.timestamp, t.token, t.type
-				FROM transactions t
-				JOIN trace_path p ON t.from_address = p.to_address
-				WHERE t.type = 'Trace' AND t.timestamp >= p.timestamp
-			)
-			SELECT p.hash, p.timestamp, p.from_address, w1.label AS from_label,
-			       p.to_address, w2.label AS to_label, p.amount, p.token, p.type
-			FROM trace_path p
-			JOIN wallets w1 ON p.from_address = w1.address
-			JOIN wallets w2 ON p.to_address = w2.address
-			ORDER BY p.timestamp ASC -- 依據資金流動時間排序
-			LIMIT 100;
-		`
+            WITH RECURSIVE trace_path AS (
+                SELECT hash, from_address, to_address, amount, timestamp, token, type
+                FROM transactions 
+                WHERE hash = $1 AND type = 'Trace'
+                
+                UNION
+                
+                SELECT t.hash, t.from_address, t.to_address, t.amount, t.timestamp, t.token, t.type
+                FROM transactions t
+                JOIN trace_path p ON t.from_address = p.to_address
+                WHERE t.type = 'Trace' AND t.timestamp >= p.timestamp
+            )
+            SELECT p.hash, p.timestamp, p.from_address, w1.label AS from_label,
+                   p.to_address, w2.label AS to_label, p.amount, p.token, p.type
+            FROM trace_path p
+            JOIN wallets w1 ON p.from_address = w1.address
+            JOIN wallets w2 ON p.to_address = w2.address
+            ORDER BY p.timestamp ASC 
+            LIMIT 100;
+        `
 		args = []interface{}{input}
 	} else {
 		// ==========================================
-		// 🕸️ BROAD 模式：具備「引力排序」的拓撲發散
+		// 🕸️ BROAD 模式：引力排序演算法 (Proximity Sorting)
+		// Design Decision: 解決大型網路視覺化時的「隨機截斷 (Random Eviction)」問題。
+		// Why: 當關聯交易超過 LIMIT 250 時，傳統的 ORDER BY 會隨機丟棄資料，
+		//      導致核心節點的連線破裂。透過計算 min_depth (最短跳數)，
+		//      我們強迫資料庫優先保留最靠近中心目標 (Target) 的交易，確保畫面由內而外穩定生長。
 		// ==========================================
 		startAddress := input
 		query = `
-			WITH RECURSIVE connected_nodes AS (
-				SELECT $1::varchar AS address, 0 AS depth
-				UNION
-				SELECT 
-					CASE WHEN t.from_address = c.address THEN t.to_address ELSE t.from_address END, 
-					c.depth + 1
-				FROM transactions t 
-				JOIN connected_nodes c ON (t.from_address = c.address OR t.to_address = c.address)
-				JOIN wallets w ON c.address = w.address
-				WHERE c.depth < 3 AND (w.label IN ('wallet', 'HighRisk') OR c.depth = 0)
-			),
-			min_depth_nodes AS (
-				-- 取得每個節點距離中心的最短層級 (Hop)
-				SELECT address, MIN(depth) as depth FROM connected_nodes GROUP BY address
-			)
-			SELECT t.hash, t.timestamp, t.from_address, w1.label AS from_label,
-				t.to_address, w2.label AS to_label, t.amount, t.token, t.type
-			FROM transactions t
-			JOIN min_depth_nodes n1 ON t.from_address = n1.address
-			JOIN min_depth_nodes n2 ON t.to_address = n2.address
-			JOIN wallets w1 ON t.from_address = w1.address
-			JOIN wallets w2 ON t.to_address = w2.address
-			-- 💡 核心修正：利用 GROUP BY 去重，並根據「與目標節點的距離」由近到遠排序
-			GROUP BY t.hash, t.timestamp, t.from_address, w1.label, t.to_address, w2.label, t.amount, t.token, t.type, n1.depth, n2.depth
-			ORDER BY LEAST(n1.depth, n2.depth) ASC, t.timestamp DESC
-			LIMIT 250; -- 將畫布容量提升至 250 條線，讓畫面更壯觀
-		`
+            WITH RECURSIVE connected_nodes AS (
+                SELECT $1::varchar AS address, 0 AS depth
+                UNION
+                SELECT 
+                    CASE WHEN t.from_address = c.address THEN t.to_address ELSE t.from_address END, 
+                    c.depth + 1
+                FROM transactions t 
+                JOIN connected_nodes c ON (t.from_address = c.address OR t.to_address = c.address)
+                JOIN wallets w ON c.address = w.address
+                -- 防禦性設計：當觸及已知的高流動性實體 (HighRisk 或預設 wallet 以外) 時，強制停止擴散 (Stop-Loss)
+                WHERE c.depth < 3 AND (w.label IN ('wallet', 'HighRisk') OR c.depth = 0)
+            ),
+            min_depth_nodes AS (
+                SELECT address, MIN(depth) as depth FROM connected_nodes GROUP BY address
+            )
+            SELECT t.hash, t.timestamp, t.from_address, w1.label AS from_label,
+                t.to_address, w2.label AS to_label, t.amount, t.token, t.type
+            FROM transactions t
+            JOIN min_depth_nodes n1 ON t.from_address = n1.address
+            JOIN min_depth_nodes n2 ON t.to_address = n2.address
+            JOIN wallets w1 ON t.from_address = w1.address
+            JOIN wallets w2 ON t.to_address = w2.address
+            GROUP BY t.hash, t.timestamp, t.from_address, w1.label, t.to_address, w2.label, t.amount, t.token, t.type, n1.depth, n2.depth
+            ORDER BY LEAST(n1.depth, n2.depth) ASC, t.timestamp DESC
+            LIMIT 250; 
+        `
 		args = []interface{}{startAddress}
 	}
 
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("執行圖論查詢失敗: %w", err)
 	}
 	defer rows.Close()
 
+	// =====================================================================
+	// 資料轉型層 (Data Mapping)
+	// Design Decision: 將關聯式資料列轉換為 Cytoscape.js 的 Node 與 Edge 陣列。
+	// =====================================================================
 	var elements []domain.CytoElement
 	addedNodes := make(map[string]bool)
 
@@ -130,23 +182,25 @@ func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool
 			continue
 		}
 
+		// 處理發送方節點 (Source Node)
 		if !addedNodes[fromAddr] {
 			displayLabel := fromAddr
 			if len(fromAddr) >= 10 {
 				displayLabel = fromAddr[:6] + "..." + fromAddr[len(fromAddr)-4:]
 			}
+			// 若有具體情報標籤，則覆蓋預設地址
 			if fromLabel != "wallet" && fromLabel != "HighRisk" && fromLabel != "Mixer" {
 				displayLabel = fromLabel
 			}
 
 			elements = append(elements, domain.CytoElement{Data: domain.CytoData{
 				ID: fromAddr, Label: displayLabel, Type: fromLabel,
-				// 在 TxHash 追蹤時，將起點發送者標為 Target
 				IsTarget: (!isTxHash && fromAddr == input) || (isTxHash && hash == input),
 			}})
 			addedNodes[fromAddr] = true
 		}
 
+		// 處理接收方節點 (Target Node)
 		if !addedNodes[toAddr] {
 			displayLabel := toAddr
 			if len(toAddr) >= 10 {
@@ -163,7 +217,7 @@ func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool
 			addedNodes[toAddr] = true
 		}
 
-		// --- 連線處理 ---
+		// 處理連線 (Edge)
 		timeStr := time.Unix(timestamp, 0).Format("01/02 15:04")
 		formattedAmount := fmt.Sprintf("%.2f %s", amount, token)
 		edgeLabel := fmt.Sprintf("%s\n🕒 %s", formattedAmount, timeStr)

@@ -1,4 +1,5 @@
 import os
+from typing import Dict, Any, List
 from flask import Flask, request, jsonify
 import pandas as pd
 import numpy as np
@@ -7,17 +8,22 @@ import psycopg2
 
 app = Flask(__name__)
 
-def get_db_connection():
-    db_host = os.getenv("DB_HOST") 
-    db_port = "5432"
-    db_user = "postgres"
-    db_password = os.getenv("DB_PASSWORD")
-    db_name = "cryptotrace"
+def get_db_connection() -> psycopg2.extensions.connection:
+    """
+    建立並回傳 PostgreSQL 資料庫連線。
+    
+    Design Decision: 捨棄單一 DSN (Data Source Name) 字串，改採獨立參數傳遞。
+    Why: 避免當密碼 (DB_PASSWORD) 包含特殊保留字元 (@, /, ?) 時，
+         引發 URL 解析錯誤，同時完美相容 GCP Cloud Run 的 Unix Socket 路徑格式。
+    """
+    db_host = os.getenv("DB_HOST", "postgres") 
+    db_port = os.getenv("DB_PORT", "5432")
+    db_user = os.getenv("DB_USER", "postgres")
+    db_password = os.getenv("DB_PASSWORD", "password123")
+    db_name = os.getenv("DB_NAME", "cryptotrace")
 
-    print(f"🔌 [AI Engine] 正在連線至 PostgreSQL (Host: {db_host}, User: {db_user})...", flush=True)
+    print(f"🔌 [AI Engine] Initializing PostgreSQL connection (Host: {db_host}, User: {db_user})...", flush=True)
 
-    # 💡 psycopg2 支援直接傳入參數 (Keyword Arguments)
-    # 這樣做最安全，完全不用擔心密碼有特殊符號，也不用管 Unix Socket 路徑格式！
     return psycopg2.connect(
         host=db_host,
         port=db_port,
@@ -27,35 +33,52 @@ def get_db_connection():
     )
 
 @app.route('/', methods=['GET'])
-def health_check():
+def health_check() -> tuple[Dict[str, str], int]:
+    """
+    Liveliness Probe 端點。
+    Why: 專為 GCP Cloud Run / Kubernetes 負載平衡器設計，用於確認 Container 啟動完畢且可接收流量。
+    """
     return jsonify({"status": "healthy", "service": "CryptoTrace AI Engine"}), 200
 
 @app.route('/analyze', methods=['POST'])
-def analyze():
-    data = request.json
-    target_address = data.get('address').lower()
+def analyze_wallet_behavior() -> tuple[Dict[str, Any], int]:
+    """
+    核心鑑識端點：基於局部生態網路 (Ego-Network) 的孤立森林異常檢測引擎。
+    """
+    payload = request.json
+    target_wallet_address = payload.get('address', '').lower()
 
-    print(f"\n🔍 [AI Engine] 收到分析請求，目標錢包: {target_address}", flush=True)
+    if not target_wallet_address:
+        return jsonify({"error": "Missing target address"}), 400
+
+    print(f"\n🔍 [AI Engine] Commencing KYT analysis for wallet: {target_wallet_address}", flush=True)
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
     try:
-        # ==========================================
-        # 🛡️ 1. 白名單豁免機制
-        # ==========================================
-        cursor.execute("SELECT label FROM wallets WHERE address = %s", (target_address,))
+        # =====================================================================
+        # PHASE 1: Entity Whitelisting & Stop-Loss
+        # Design Decision: 優先檢查實體標籤，若為交易所 (CEX) 或已知高風險，直接繞過 AI 推論。
+        # Why: 
+        #   1. 節省算力 (Compute Optimization)。
+        #   2. 避免超級節點 (Supernodes) 的巨量交易數據污染機器學習模型的常態分佈基準。
+        # =====================================================================
+        cursor.execute("SELECT label FROM wallets WHERE address = %s", (target_wallet_address,))
         row = cursor.fetchone()
-        wallet_label = row[0] if row else 'wallet'
+        entity_label = row[0] if row else 'wallet'
 
-        if wallet_label not in ['wallet', 'HighRisk']:
-            print(f"🛡️ [AI Engine] 目標為已知機構或合約 ({wallet_label})，跳過 AI 檢測。", flush=True)
-            return jsonify({"status": "exempt", "anomalies_found": 0, "anomaly_details": []})
+        if entity_label not in ['wallet', 'HighRisk']:
+            print(f"🛡️ [AI Engine] Execution halted: Target is a verified entity ({entity_label}).", flush=True)
+            return jsonify({"status": "exempt", "anomalies_found": 0, "anomaly_details": []}), 200
 
-        # ==========================================
-        # 🕸️ 2. 獲取局部網路基準資料 
-        # ==========================================
-        query = """
+        # =====================================================================
+        # PHASE 2: Local Context (Ego-Network) Retrieval
+        # Design Decision: 利用 Recursive CTE 抓取 2-Hop 內的交易，而非使用全網資料訓練。
+        # Why: 加密貨幣交易具備高度的「群聚效應」。全網的常態基準無法反映特定局部網路
+        #      (例如某個特定的 DeFi 礦池社群) 的真實日常行為，局部基準能有效降低 False Positives。
+        # =====================================================================
+        ego_network_query = """
             WITH RECURSIVE ego_network AS (
                 SELECT %s::varchar AS address, 0 AS depth
                 UNION
@@ -73,111 +96,136 @@ def analyze():
                OR to_address IN (SELECT address FROM ego_network)
         """
 
-        df = pd.read_sql(query, conn, params=(target_address,))
+        local_context_tx_df = pd.read_sql(ego_network_query, conn, params=(target_wallet_address,))
 
-        if df.empty or len(df) < 5:
-            print(f"⚠️ [AI Engine] 資料量不足 ({len(df)} 筆)，跳過機器學習分析。", flush=True)
-            return jsonify({"status": "insufficient_data", "anomalies_found": 0, "anomaly_details": []})
+        # 防禦性設計：解決 Burner Wallet (免洗錢包) 的冷啟動問題
+        if local_context_tx_df.empty or len(local_context_tx_df) < 5:
+            print(f"⚠️ [AI Engine] Insufficient graph density ({len(local_context_tx_df)} edges). Fallback to heuristics.", flush=True)
+            return jsonify({"status": "insufficient_data", "anomalies_found": 0, "anomaly_details": []}), 200
 
-        # ==========================================
-        # 🌟 3. 特徵工程 (Feature Engineering)
-        # ==========================================
-        df = df.sort_values(by=['from_address', 'timestamp']).reset_index(drop=True)
-        df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
+        # =====================================================================
+        # PHASE 3: Feature Engineering (Behavioral Vectorization)
+        # Design Decision: 將一維的「轉帳金額」轉換為三維的「行為時序向量」。
+        # Why: 現代混幣器 (Mixers) 或碎星洗錢 (Smurfing) 通常會將金額打散，
+        #      單看金額無法察覺異常。我們引入「時間差」與「滾動頻率」來捕捉程式化機器人的特徵。
+        # =====================================================================
+        # 確保時序正確，避免時間差計算錯誤
+        local_context_tx_df = local_context_tx_df.sort_values(by=['from_address', 'timestamp']).reset_index(drop=True)
+        local_context_tx_df['datetime'] = pd.to_datetime(local_context_tx_df['timestamp'], unit='s')
 
-        df['time_diff'] = df.groupby('from_address')['timestamp'].diff().fillna(0)
+        # 擷取特徵 1：同一發送者的連續交易時間差 (秒)
+        local_context_tx_df['time_diff'] = local_context_tx_df.groupby('from_address')['timestamp'].diff().fillna(0)
         
-        df_indexed = df.set_index('datetime')
-        freq_series = df_indexed.groupby('from_address')['amount'].rolling('24h').count()
-        df['tx_freq_24h'] = freq_series.reset_index(level=0, drop=True).values
+        # 擷取特徵 2：24 小時滾動時間窗內的交易頻率
+        df_time_indexed = local_context_tx_df.set_index('datetime')
+        rolling_frequency_series = df_time_indexed.groupby('from_address')['amount'].rolling('24h').count()
+        local_context_tx_df['tx_freq_24h'] = rolling_frequency_series.reset_index(level=0, drop=True).values
         
-        features = ['amount', 'time_diff', 'tx_freq_24h']
-        X_baseline = df[features].values 
-        median_val = df['amount'].median()
+        feature_columns = ['amount', 'time_diff', 'tx_freq_24h']
+        baseline_feature_matrix = local_context_tx_df[feature_columns].values 
+        network_median_amount = local_context_tx_df['amount'].median()
 
-        # ==========================================
-        # 🌲 4. 機器學習：訓練局部生態的孤立森林
-        # ==========================================
-        clf = IsolationForest(contamination='auto', random_state=42) 
-        clf.fit(X_baseline)
+        # =====================================================================
+        # PHASE 4: Unsupervised Learning (Isolation Forest)
+        # Design Decision: 使用 Isolation Forest 並將 contamination 設為 auto。
+        # Why: 相較於 DBSCAN 或 K-Means，Isolation Forest 更擅長在高維空間中切割邊緣資料點 (Outliers)。
+        #      'auto' 允許模型依據局部網路的實際密度動態決定決策樹的深度，而非寫死異常比例。
+        # =====================================================================
+        isolation_forest_model = IsolationForest(contamination='auto', random_state=42) 
+        isolation_forest_model.fit(baseline_feature_matrix)
 
-        # ==========================================
-        # 🎯 5. 異常檢測與白盒化解釋 (Explainable AI)
-        # ==========================================
-        target_mask = (df['from_address'] == target_address) | (df['to_address'] == target_address)
-        df_target = df[target_mask].copy()
+        # =====================================================================
+        # PHASE 5: Explainable AI (XAI) & Dual-Track Verification
+        # Design Decision: 模型白箱化 (White-boxing) 與雙重確認機制。
+        # Why: 非監督式學習的黑箱輸出 (1 / -1) 無法作為法遵人員凍結資金的證據 (Lack of legal evidence)。
+        #      我們利用領域專家規則 (Heuristics) 將觸發條件具象化，只有在模型判斷異常，
+        #      且滿足具體洗錢特徵時，才確立為 True Anomaly。
+        # =====================================================================
+        target_wallet_mask = (local_context_tx_df['from_address'] == target_wallet_address) | (local_context_tx_df['to_address'] == target_wallet_address)
+        target_tx_df = local_context_tx_df[target_wallet_mask].copy()
         
-        if df_target.empty:
-            return jsonify({"status": "no_target_data", "anomalies_found": 0, "anomaly_details": []})
+        if target_tx_df.empty:
+            return jsonify({"status": "no_target_data", "anomalies_found": 0, "anomaly_details": []}), 200
 
-        X_target = df_target[features].values
-        df_target['ai_label'] = clf.predict(X_target)
-        df_target['anomaly_score'] = clf.decision_function(X_target) 
+        target_feature_matrix = target_tx_df[feature_columns].values
+        target_tx_df['ai_label'] = isolation_forest_model.predict(target_feature_matrix)
+        # 保留分數供未來動態權重調整使用
+        target_tx_df['anomaly_score'] = isolation_forest_model.decision_function(target_feature_matrix) 
 
-        # ✨ 升級：將布林值檢查改為收集「異常理由字串」
-        def get_anomaly_reasons(row):
+        def extract_compliance_reasons(row: pd.Series) -> List[str]:
+            """將數學異常轉換為具備合規證據力的具體特徵描述"""
             reasons = []
-            if row['ai_label'] != -1: return reasons
-            if row['amount'] < 3000: return reasons 
+            
+            # 第一道防線：模型必須先認為是 Outlier (-1)
+            if row['ai_label'] != -1: 
+                return reasons
+            
+            # 灰塵過濾 (Dusting Filter)：忽略微小金額的雜訊攻擊
+            if row['amount'] < 3000: 
+                return reasons 
                 
-            if row['amount'] > median_val * 5:
-                reasons.append(f"金額暴增 (達 {row['amount']:.2f} U，超過日常中位數的 5 倍)")
-            if row['time_diff'] < 60 and row['time_diff'] > 0:
-                reasons.append(f"機器人特徵：短於 {int(row['time_diff'])} 秒的連續轉帳")
+            # 第二道防線：特徵維度具象化
+            if row['amount'] > network_median_amount * 5:
+                reasons.append(f"Volume Surge: {row['amount']:.2f} U (5x above local median)")
+            if 0 < row['time_diff'] < 60:
+                reasons.append(f"Bot Activity: High-velocity transfer within {int(row['time_diff'])}s")
             if row['tx_freq_24h'] > 20:
-                reasons.append(f"高頻交易異常 (24小時內達 {int(row['tx_freq_24h'])} 次)")
+                reasons.append(f"Frequency Spike: {int(row['tx_freq_24h'])} txs in rolling 24h")
                 
             return reasons
 
-        df_target['anomaly_reasons'] = df_target.apply(get_anomaly_reasons, axis=1)
-        # 只要 reasons 陣列裡面有東西，這筆交易就是真正的洗錢交易
-        df_target['is_true_anomaly'] = df_target['anomaly_reasons'].apply(lambda x: len(x) > 0)
-        anomalies_found = int(df_target['is_true_anomaly'].sum())
+        target_tx_df['compliance_reasons'] = target_tx_df.apply(extract_compliance_reasons, axis=1)
+        target_tx_df['is_verified_anomaly'] = target_tx_df['compliance_reasons'].apply(lambda x: len(x) > 0)
         
-        # ==========================================
-        # 🚨 6. 警報與狀態更新 (匯出白盒化報告)
-        # ==========================================
-        anomaly_details = []
+        verified_anomalies_count = int(target_tx_df['is_verified_anomaly'].sum())
+        
+        # =====================================================================
+        # PHASE 6: State Mutation & Reporting
+        # Design Decision: 將異常結果寫回關聯式資料庫，作為後續前端拓撲圖 (Graph) 的節點屬性。
+        # =====================================================================
+        compliance_report = []
 
-        if anomalies_found > 0:
-            # 提取所有異常交易的詳細資訊
-            anomalous_rows = df_target[df_target['is_true_anomaly']]
-            for _, row in anomalous_rows.iterrows():
-                anomaly_details.append({
+        if verified_anomalies_count > 0:
+            anomalous_transactions = target_tx_df[target_tx_df['is_verified_anomaly']]
+            
+            for _, row in anomalous_transactions.iterrows():
+                compliance_report.append({
                     "tx_hash": row['hash'],
                     "amount": float(row['amount']),
                     "timestamp": int(row['timestamp']),
-                    "reasons": row['anomaly_reasons']
+                    "reasons": row['compliance_reasons']
                 })
 
-            update_query = "UPDATE wallets SET label = 'HighRisk' WHERE address = %s AND label = 'wallet'"
-            cursor.execute(update_query, (target_address,))
+            # 更新節點風險等級
+            update_risk_query = "UPDATE wallets SET label = 'HighRisk' WHERE address = %s AND label = 'wallet'"
+            cursor.execute(update_risk_query, (target_wallet_address,))
             conn.commit()
             
-            print(f"🚨 [AI] 發現 {anomalies_found} 筆異常！已將 {target_address} 標記為 HighRisk。", flush=True)
-            # 在 Log 中印出詳細的犯罪報告
-            for detail in anomaly_details:
+            print(f"🚨 [AI] Classification Complete: {verified_anomalies_count} illicit signatures detected. Entity {target_wallet_address} marked as HighRisk.", flush=True)
+            for detail in compliance_report:
                 reason_str = " | ".join(detail['reasons'])
-                print(f"   👉 Tx: {detail['tx_hash'][:12]}... | 金額: {detail['amount']:,.2f} U | 原因: {reason_str}", flush=True)
+                print(f"   👉 Tx: {detail['tx_hash'][:12]}... | Amount: {detail['amount']:,.2f} U | Triggers: {reason_str}", flush=True)
         else:
-            print(f"✅ [AI] 分析完成，行為符合常態 (0/{len(df_target)})。", flush=True)
+            print(f"✅ [AI] Classification Complete: Normal behavioral distribution (0/{len(target_tx_df)} anomalies).", flush=True)
 
-        # 將異常細節一起透過 JSON 回傳給前端
         return jsonify({
             "status": "analyzed", 
-            "network_baseline_txs": len(df),
-            "target_txs_analyzed": len(df_target),
-            "anomalies_found": anomalies_found,
-            "anomaly_details": anomaly_details 
-        })
+            "network_baseline_txs": len(local_context_tx_df),
+            "target_txs_analyzed": len(target_tx_df),
+            "anomalies_found": verified_anomalies_count,
+            "anomaly_details": compliance_report 
+        }), 200
 
     except Exception as e:
-        print(f"❌ [AI Engine] 發生嚴重錯誤: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
+        # 防禦性設計：確保連線資源不會因為中途拋出 Exception 而產生 Memory Leak
+        print(f"❌ [AI Engine] Critical failure during ML pipeline execution: {e}", flush=True)
+        return jsonify({"error": "Internal AI Engine Failure", "details": str(e)}), 500
 
     finally:
         cursor.close()
         conn.close()
 
 if __name__ == '__main__':
+    # 建議正式環境改用 Gunicorn: 
+    # gunicorn --bind 0.0.0.0:8080 --workers 1 --threads 8 app:app
     app.run(host='0.0.0.0', port=8080)

@@ -5,7 +5,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y libpq-dev gcc
 
 COPY requirements.txt .
-RUN pip install flask pandas numpy scikit-learn psycopg2-binary gunicorn
+RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 
 EXPOSE 8080
