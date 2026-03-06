@@ -1,0 +1,58 @@
+name: Deploy Analysis to Cloud Run
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'analysis/**'
+      - '.github/workflow/deploy_analysis.yml'
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  REPO_NAME: cryptotrace-repo
+  SERVICE_NAME: cryptotrace-analysis
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 1. 登入 Google Cloud
+      - name: Google Auth
+        uses: 'google-github-actions/auth@v2'
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+
+      # 2. 設定 gcloud CLI
+      - name: Set up Cloud SDK
+        uses: 'google-github-actions/setup-gcloud@v2'
+
+      # 3. 設定 Docker 權限
+      - name: Configure Docker
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+
+      # 4. 打包 Docker Image 並推送到 Artifact Registry
+      - name: Build and Push Container
+        run: |
+          docker build -t "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.SERVICE_NAME }}:${{ github.sha }}" ./analysis
+          docker push "${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+
+      # 5. 部署到 Cloud Run
+      - name: Deploy to Cloud Run
+        uses: 'google-github-actions/deploy-cloudrun@v2'
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          image: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+          # 關鍵：連結 Cloud SQL
+          flags: --add-cloudsql-instances=${{ secrets.DB_INSTANCE_NAME }} --allow-unauthenticated
+          # 設定環境變數
+          env_vars: |
+            DATABASE_URL=postgres://postgres:password123@/${{ secrets.DB_NAME }}?host=/cloudsql/${{ secrets.DB_INSTANCE_NAME }}&sslmode=disable

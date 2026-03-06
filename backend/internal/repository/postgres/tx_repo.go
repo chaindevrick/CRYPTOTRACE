@@ -47,41 +47,66 @@ func (r *txRepository) ResolveLabel(ctx context.Context, address string) string 
 }
 
 func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool) ([]domain.CytoElement, error) {
-	startAddress := input
+	var query string
+	var args []interface{}
 
 	if isTxHash {
-		err := r.db.QueryRowContext(ctx, "SELECT to_address FROM transactions WHERE hash = $1 LIMIT 1", input).Scan(&startAddress)
-		if err != nil {
-			return []domain.CytoElement{}, nil
-		}
+		// ==========================================
+		// 🎯 FLOW 模式：精準溯源一條直線 (Linear Trace)
+		// ==========================================
+		query = `
+			WITH RECURSIVE trace_path AS (
+				-- 1. 起點：精準鎖定使用者輸入的那筆 TxHash (且必須是 Trace 產生的)
+				SELECT hash, from_address, to_address, amount, timestamp, token, type
+				FROM transactions 
+				WHERE hash = $1 AND type = 'Trace'
+				
+				UNION
+				
+				-- 2. 遞迴：只沿著 type = 'Trace' 標記往下游找，完全杜絕發散
+				SELECT t.hash, t.from_address, t.to_address, t.amount, t.timestamp, t.token, t.type
+				FROM transactions t
+				JOIN trace_path p ON t.from_address = p.to_address
+				WHERE t.type = 'Trace' AND t.timestamp >= p.timestamp
+			)
+			SELECT p.hash, p.timestamp, p.from_address, w1.label AS from_label,
+			       p.to_address, w2.label AS to_label, p.amount, p.token, p.type
+			FROM trace_path p
+			JOIN wallets w1 ON p.from_address = w1.address
+			JOIN wallets w2 ON p.to_address = w2.address
+			LIMIT 50;
+		`
+		args = []interface{}{input}
+	} else {
+		// ==========================================
+		// 🕸️ BROAD 模式：原本的 3 層拓撲發散 (Ego-Network)
+		// ==========================================
+		startAddress := input
+		query = `
+			WITH RECURSIVE connected_nodes AS (
+				SELECT $1::varchar AS address, 0 AS depth
+				UNION
+				SELECT 
+					CASE WHEN t.from_address = c.address THEN t.to_address ELSE t.from_address END, 
+					c.depth + 1
+				FROM transactions t 
+				JOIN connected_nodes c ON (t.from_address = c.address OR t.to_address = c.address)
+				JOIN wallets w ON c.address = w.address
+				WHERE c.depth < 3 AND (w.label IN ('wallet', 'HighRisk') OR c.depth = 0)
+			)
+			SELECT DISTINCT t.hash, t.timestamp, t.from_address, w1.label AS from_label,
+				t.to_address, w2.label AS to_label, t.amount, t.token, t.type
+			FROM transactions t
+			JOIN connected_nodes n1 ON t.from_address = n1.address
+			JOIN connected_nodes n2 ON t.to_address = n2.address
+			JOIN wallets w1 ON t.from_address = w1.address
+			JOIN wallets w2 ON t.to_address = w2.address
+			LIMIT 150;
+		`
+		args = []interface{}{startAddress}
 	}
-
-	query := `
-		WITH RECURSIVE connected_nodes AS (
-			SELECT $1::varchar AS address, 0 AS depth
-			UNION
-			SELECT 
-				CASE WHEN t.from_address = c.address THEN t.to_address ELSE t.from_address END, 
-				c.depth + 1
-			FROM transactions t 
-			JOIN connected_nodes c ON (t.from_address = c.address OR t.to_address = c.address)
-			JOIN wallets w ON c.address = w.address
-			WHERE c.depth < 4 
-			  AND (w.label IN ('wallet', 'HighRisk') OR c.depth = 0)
-			  AND t.amount >= 0.01 -- 🛡️ 阻斷邏輯 2：過濾掉小於 0.01 U 的灰塵與釣魚交易
-		)
-		SELECT DISTINCT t.hash, t.timestamp, t.from_address, w1.label AS from_label,
-			t.to_address, w2.label AS to_label, t.amount, t.token, t.type
-		FROM transactions t
-		JOIN connected_nodes n1 ON t.from_address = n1.address
-		JOIN connected_nodes n2 ON t.to_address = n2.address
-		JOIN wallets w1 ON t.from_address = w1.address
-		JOIN wallets w2 ON t.to_address = w2.address
-		WHERE t.amount >= 0.01 -- 🛡️ 確保最終輸出的圖表絕對沒有 0.00 的連線
-		LIMIT 150;
-	`
 	
-	rows, err := r.db.QueryContext(ctx, query, startAddress)
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -90,6 +115,7 @@ func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool
 	var elements []domain.CytoElement
 	addedNodes := make(map[string]bool)
 
+	// 以下為原本的 Cytoscape 節點與連線解析邏輯，完全不用動！
 	for rows.Next() {
 		var hash, fromAddr, fromLabel, toAddr, toLabel, token, txType string
 		var amount float64
@@ -101,32 +127,25 @@ func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool
 
 		if !addedNodes[fromAddr] {
 			displayLabel := fromAddr
-			if len(fromAddr) >= 10 {
-				displayLabel = fromAddr[:6] + "..." + fromAddr[len(fromAddr)-4:]
-			}
-			if fromLabel != "wallet" && fromLabel != "HighRisk" && fromLabel != "Mixer" {
-				displayLabel = fromLabel
-			}
-
+			if len(fromAddr) >= 10 { displayLabel = fromAddr[:6] + "..." + fromAddr[len(fromAddr)-4:] }
+			if fromLabel != "wallet" && fromLabel != "HighRisk" && fromLabel != "Mixer" { displayLabel = fromLabel }
+			
 			elements = append(elements, domain.CytoElement{Data: domain.CytoData{
 				ID: fromAddr, Label: displayLabel, Type: fromLabel,
-				IsTarget: fromAddr == startAddress || (isTxHash && hash == input),
+				// 在 TxHash 追蹤時，將起點發送者標為 Target
+				IsTarget: (!isTxHash && fromAddr == input) || (isTxHash && hash == input), 
 			}})
 			addedNodes[fromAddr] = true
 		}
-
+		
 		if !addedNodes[toAddr] {
 			displayLabel := toAddr
-			if len(toAddr) >= 10 {
-				displayLabel = toAddr[:6] + "..." + toAddr[len(toAddr)-4:]
-			}
-			if toLabel != "wallet" && toLabel != "HighRisk" && toLabel != "Mixer" {
-				displayLabel = toLabel
-			}
-
+			if len(toAddr) >= 10 { displayLabel = toAddr[:6] + "..." + toAddr[len(toAddr)-4:] }
+			if toLabel != "wallet" && toLabel != "HighRisk" && toLabel != "Mixer" { displayLabel = toLabel }
+			
 			elements = append(elements, domain.CytoElement{Data: domain.CytoData{
-				ID: toAddr, Label: displayLabel, Type: toLabel,
-				IsTarget: toAddr == startAddress,
+				ID: toAddr, Label: displayLabel, Type: toLabel, 
+				IsTarget: !isTxHash && toAddr == input,
 			}})
 			addedNodes[toAddr] = true
 		}
