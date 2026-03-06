@@ -36,7 +36,7 @@ WORKDIR /app
 COPY --from=builder /app/main .
 
 # 暴露 Port
-EXPOSE 3000
+EXPOSE 8080
 
 # 啟動應用程式
 CMD ["./main"]

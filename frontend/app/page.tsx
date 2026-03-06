@@ -22,10 +22,13 @@ export default function ForensicsDashboard() {
   const [mode, setMode] = useState<'overview' | 'trace'>('overview');
   const [stats, setStats] = useState<AnalysisStats>({ riskScore: 0, nodeCount: 0, mode: 'overview' });
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [syncState, setSyncState] = useState<'syncing' | 'synced'>('synced'); // LIVE SYNC 狀態
+  const [syncState, setSyncState] = useState<'syncing' | 'synced'>('synced');
 
   const cyRef = useRef<HTMLDivElement>(null);
   const cyInstance = useRef<Core | null>(null);
+
+  // ✨ 確保你的 API 網址沒有 :8080，並優先使用環境變數
+  const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://cryptotrace-backend-713204579643.us-central1.run.app';
 
   const getRiskColor = (score: number) => {
     if (score >= 80) return 'text-[#FF003C] drop-shadow-[0_0_12px_rgba(255,0,60,0.6)]';
@@ -33,7 +36,6 @@ export default function ForensicsDashboard() {
     return 'text-[#00FF9D] drop-shadow-[0_0_12px_rgba(0,255,157,0.4)]';
   };
 
-  // ✨ 風險與節點計算函數
   const calculateRiskAndNodes = (graphData: GraphElement[], currentMode: string) => {
     let calculatedRisk = 0;
     const uniqueNodes = new Set();
@@ -70,9 +72,9 @@ export default function ForensicsDashboard() {
     if (!targetAddress) return;
     
     setAnalyzing(true);
-    setHasGraphData(false);
     setErrorMsg(null);
-    setSyncState('syncing'); // 開始同步
+    setSyncState('syncing'); 
+    setHasGraphData(true);
     
     if (cyInstance.current) {
       cyInstance.current.destroy();
@@ -80,14 +82,21 @@ export default function ForensicsDashboard() {
     }
 
     try {
-      const endpoint = mode === 'trace' ? 'https://cryptotrace-backend-713204579643.us-central1.run.app/api/trace' : 'https://cryptotrace-backend-713204579643.us-central1.run.app/api/analyze';
+      const endpoint = mode === 'trace' ? `${API_BASE_URL}/api/trace` : `${API_BASE_URL}/api/analyze`;
+      
+      // ⏳ 這裡會卡住，直到後端完全處理完畢
       await axios.post(endpoint, { address: targetAddress });
       
-      const response = await axios.get<GraphElement[]>(`https://cryptotrace-backend-713204579643.us-central1.run.app/api/graph/${targetAddress}`);
+      // ✅ 後端處理完成，關閉同步動畫
+      setSyncState('synced'); 
+      
+      // 抓取最終完整的圖表資料
+      const response = await axios.get<GraphElement[]>(`${API_BASE_URL}/api/graph/${targetAddress}`);
       const graphData = response.data;
 
       if (!graphData || graphData.length === 0) {
         setErrorMsg('No actionable data found for this address.');
+        setHasGraphData(false);
         return;
       }
 
@@ -99,50 +108,44 @@ export default function ForensicsDashboard() {
         mode: mode
       });
 
-      setHasGraphData(true);
       setTimeout(() => renderGraph(graphData), 200);
 
     } catch (err: any) {
       console.error(err);
       setErrorMsg(err.response?.data?.error || 'Analysis engine failure.');
+      setSyncState('synced'); 
+      setHasGraphData(false);
     } finally {
       setAnalyzing(false);
     }
   };
 
-  // ✨ 自動輪詢背景進度 (Live Sync)
+  // ✨ 自動輪詢背景進度 (Live Sync) - 精準信號版
   useEffect(() => {
     let intervalId: NodeJS.Timeout;
-    let unchangedCount = 0; // 記錄有幾次沒發現新節點
 
-    if (hasGraphData && mode === 'overview' && targetAddress && syncState === 'syncing') {
+    if (hasGraphData && targetAddress && syncState === 'syncing') {
       intervalId = setInterval(async () => {
         try {
-          const response = await axios.get<GraphElement[]>(`https://cryptotrace-backend-713204579643.us-central1.run.app/api/graph/${targetAddress}`);
+          const response = await axios.get<GraphElement[]>(`${API_BASE_URL}/api/graph/${targetAddress}`);
           const graphData = response.data;
 
           if (graphData && graphData.length > 0) {
             const { calculatedRisk, nodeCount } = calculateRiskAndNodes(graphData, mode);
 
             setStats(prev => {
-              // 只有當發現新節點或風險分數改變時，才更新畫面
+              // 只有當數量或風險改變時，才重新渲染
               if (prev.nodeCount !== nodeCount || prev.riskScore !== calculatedRisk) {
-                unchangedCount = 0; // 有新進度，重置計數
                 setTimeout(() => renderGraph(graphData), 100);
                 return { ...prev, nodeCount: nodeCount, riskScore: calculatedRisk };
-              } else {
-                unchangedCount += 1; // 沒新進度，累積次數
-                if (unchangedCount >= 3) {
-                  setSyncState('synced'); // 連續三次沒進度，視為同步完成
-                }
-                return prev;
               }
+              return prev;
             });
           }
         } catch (error) {
           console.error('Live sync error:', error);
         }
-      }, 8000); // 每 8 秒偷抓一次
+      }, 8000); 
     }
 
     return () => {
@@ -358,10 +361,10 @@ export default function ForensicsDashboard() {
             <div className="bg-white/5 px-5 py-3 border-b border-white/5 flex items-center justify-between">
               <span className="text-[10px] tracking-[0.15em] font-bold text-slate-400 uppercase flex items-center gap-2">
                 Intelligence
-                {mode === 'overview' && syncState === 'syncing' && (
+                {syncState === 'syncing' && (
                   <span className="text-[#00E0FF] tracking-widest text-[8px] animate-pulse">(LIVE SYNC)</span>
                 )}
-                {mode === 'overview' && syncState === 'synced' && (
+                {syncState === 'synced' && (
                   <span className="text-[#00FF9D] tracking-widest text-[8px]">(SYNCED)</span>
                 )}
               </span>
@@ -414,7 +417,7 @@ export default function ForensicsDashboard() {
       </div>
 
       {analyzing && (
-        <div className="absolute inset-0 z-50 bg-[#0A0A0C]/90 backdrop-blur-md flex flex-col items-center justify-center">
+        <div className="absolute inset-0 z-50 bg-[#0A0A0C]/70 backdrop-blur-sm flex flex-col items-center justify-center pointer-events-none">
           <div className="relative w-64 h-1 bg-[#1E1E24] rounded-full overflow-hidden mb-6">
             <div className="absolute top-0 bottom-0 left-0 bg-[#00E0FF] shadow-[0_0_15px_#00E0FF] w-1/2 animate-[scan_1s_ease-in-out_infinite_alternate]" />
           </div>

@@ -8,10 +8,10 @@ import psycopg2
 app = Flask(__name__)
 
 def get_db_connection():
-    db_host = os.getenv("DB_HOST", "postgres") 
+    db_host = os.getenv("DB_HOST") 
     db_port = "5432"
     db_user = "postgres"
-    db_password = os.getenv("DB_PASSWORD", "password123")
+    db_password = os.getenv("DB_PASSWORD")
     db_name = "cryptotrace"
 
     print(f"🔌 [AI Engine] 正在連線至 PostgreSQL (Host: {db_host}, User: {db_user})...", flush=True)
@@ -25,6 +25,10 @@ def get_db_connection():
         password=db_password,
         dbname=db_name
     )
+
+@app.route('/', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy", "service": "CryptoTrace AI Engine"}), 200
 
 @app.route('/analyze', methods=['POST'])
 def analyze():

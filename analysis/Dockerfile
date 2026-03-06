@@ -5,10 +5,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y libpq-dev gcc
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
+RUN pip install flask pandas numpy scikit-learn psycopg2-binary gunicorn
 COPY app.py .
 
-EXPOSE 5000
+EXPOSE 8080
 
-CMD ["python", "app.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "8", "--timeout", "0", "app:app"]
