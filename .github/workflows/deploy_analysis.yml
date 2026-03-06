@@ -5,6 +5,7 @@ on:
     branches: [ "main" ]
     paths:
       - 'analysis/**'
+      - '.github/workflows/deploy_analysis.yml'
 
 env:
   PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
