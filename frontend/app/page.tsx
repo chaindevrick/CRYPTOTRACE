@@ -80,10 +80,10 @@ export default function ForensicsDashboard() {
     }
 
     try {
-      const endpoint = mode === 'trace' ? 'https://cryptotrace-backend-713204579643.us-central1.run.app:8080/api/trace' : 'https://cryptotrace-backend-713204579643.us-central1.run.app:8080/api/analyze';
+      const endpoint = mode === 'trace' ? 'https://cryptotrace-backend-713204579643.us-central1.run.app/api/trace' : 'https://cryptotrace-backend-713204579643.us-central1.run.app/api/analyze';
       await axios.post(endpoint, { address: targetAddress });
       
-      const response = await axios.get<GraphElement[]>(`https://cryptotrace-backend-713204579643.us-central1.run.app:8080/api/graph/${targetAddress}`);
+      const response = await axios.get<GraphElement[]>(`https://cryptotrace-backend-713204579643.us-central1.run.app/api/graph/${targetAddress}`);
       const graphData = response.data;
 
       if (!graphData || graphData.length === 0) {
@@ -118,7 +118,7 @@ export default function ForensicsDashboard() {
     if (hasGraphData && mode === 'overview' && targetAddress && syncState === 'syncing') {
       intervalId = setInterval(async () => {
         try {
-          const response = await axios.get<GraphElement[]>(`https://cryptotrace-backend-713204579643.us-central1.run.app:8080/api/graph/${targetAddress}`);
+          const response = await axios.get<GraphElement[]>(`https://cryptotrace-backend-713204579643.us-central1.run.app/api/graph/${targetAddress}`);
           const graphData = response.data;
 
           if (graphData && graphData.length > 0) {
