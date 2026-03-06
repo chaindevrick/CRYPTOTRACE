@@ -12,7 +12,6 @@ env:
   REGION: us-central1
   REPO_NAME: cryptotrace-repo
   SERVICE_NAME: cryptotrace-backend
-  DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
 
 jobs:
   deploy:
@@ -38,6 +37,7 @@ jobs:
       # 3. 設定 Docker 權限
       - name: Configure Docker
         run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+             
 
       # 4. 打包 Docker Image 並推送到 Artifact Registry
       - name: Build and Push Container
@@ -60,3 +60,4 @@ jobs:
             ETHERSCAN_API_KEY=${{ secrets.ETHERSCAN_API_KEY }}
             AI_ENGINE_URL=${{ secrets.AI_ENGINE_URL }}
             DUNE_API_KEY=${{ secrets.DUNE_API_KEY }}
+            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
