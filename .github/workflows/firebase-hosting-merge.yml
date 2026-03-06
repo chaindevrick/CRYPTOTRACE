@@ -17,3 +17,4 @@ jobs:
           firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_CRYPTOTRACE_489401 }}
           channelId: live
           projectId: cryptotrace-489401
+          entryPoint: ./frontend
