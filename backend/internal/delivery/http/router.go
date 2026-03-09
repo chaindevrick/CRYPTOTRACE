@@ -29,7 +29,7 @@ func NewRouter(handler *ForensicsHandler) *gin.Engine {
 	//      CryptoTrace 前端 (及本地開發環境) 能呼叫這座強大的鑑識引擎。
 	// =====================================================================
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000", "https://cryptotrace-489401.web.app"},
+		AllowOrigins:     []string{"http://localhost", "https://cryptotrace-489401.web.app"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},

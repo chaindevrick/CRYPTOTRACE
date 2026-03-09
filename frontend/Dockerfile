@@ -8,6 +8,9 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 # 利用 Docker 的層級快取 (Layer Caching) 加速 npm install
+ARG NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_URL=http://localhost:3000
+
 COPY package.json package-lock.json ./
 RUN npm ci
 
