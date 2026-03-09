@@ -11,7 +11,8 @@ on:
 jobs:
   build_and_deploy:
     runs-on: ubuntu-latest
-
+    env:
+      NEXT_OUTPUT_MODE: export
     steps:
       - uses: actions/checkout@v4
 
