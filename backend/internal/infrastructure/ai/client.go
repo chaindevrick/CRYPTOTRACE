@@ -38,7 +38,7 @@ func NewClient(engineURL string) domain.AIRepository {
 		//      Goroutine 與 Connection Pool 被迅速耗盡，最終拖垮整個系統。
 		// =====================================================================
 		httpClient: &http.Client{
-			Timeout: 15 * time.Second,
+			Timeout: 60 * time.Second,
 		},
 	}
 }
