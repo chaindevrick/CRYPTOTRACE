@@ -26,7 +26,7 @@ func NewRouter(handler *ForensicsHandler) *gin.Engine {
 	// Why: 由於前端部署於 Firebase Hosting (無伺服器靜態網頁)，瀏覽器會基於同源政策
 	//      (Same-Origin Policy) 預設阻擋跨網域的 API 請求。
 	//      我們嚴格限制來源，能有效防禦跨站請求偽造 (CSRF) 攻擊，確保只有官方的
-	//      CryptoTrace 前端 (及本地開發環境) 能呼叫這座強大的鑑識引擎。
+	//      CryptoTrace 前端 (及本地開發環境) 能呼叫。
 	// =====================================================================
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"http://localhost", "https://cryptotrace-489401.web.app"},
