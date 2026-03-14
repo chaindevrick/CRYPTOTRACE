@@ -8,11 +8,22 @@ import { Search, Activity, Share2, Target, ShieldAlert, Layers, Calendar } from 
 import { GraphElement, GraphNode, GraphEdge, AnalysisStats } from '@/types';
 
 if (typeof window !== 'undefined') {
-  try { cytoscape.use(dagre); } 
-  catch (e) {
-    console.error('Failed to load cytoscape-dagre layout extension:', e);
-  }
+  try { cytoscape.use(dagre); } catch (e) {}
 }
+
+// =====================================================================
+// 🎨 色彩產生器 (Hash-to-Color)
+// Design Decision: 將字串雜湊為 HSL 色碼。
+// Why: 確保同一個地址永遠配對同一個顏色，且 S=85%, L=65% 確保在深色模式下非常亮眼。
+// =====================================================================
+const stringToColor = (str: string) => {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = str.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  const h = Math.abs(hash) % 360;
+  return `hsl(${h}, 85%, 65%)`;
+};
 
 export default function ForensicsDashboard() {
   const [queryIdentifier, setQueryIdentifier] = useState<string>('');
@@ -32,7 +43,6 @@ export default function ForensicsDashboard() {
 
   const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://cryptotrace-backend-713204579643.us-central1.run.app';
 
-  // 💡 將 YYYY-MM-DD 轉為 Unix Timestamp 供後端使用
   const getUnixTimestamp = useCallback((dateString: string, isEnd: boolean = false) => {
     if (!dateString) return 0;
     const date = new Date(dateString);
@@ -70,80 +80,104 @@ export default function ForensicsDashboard() {
     return { computedRisk, entityCount: uniqueEntities.size };
   };
 
-  const renderTopology = useCallback((elements: GraphElement[]) => {
+const renderTopology = useCallback((elements: GraphElement[]) => {
     if (!cyRef.current) return;
     if (cyInstance.current) cyInstance.current.destroy();
 
-    const isTraceMode = analysisMode === 'trace';
+    const styledElements = elements.map(el => {
+      const newEl = JSON.parse(JSON.stringify(el));
+      if (!newEl.data.source) {
+        newEl.data.color = stringToColor(newEl.data.id);
+      } else {
+        newEl.data.color = stringToColor(newEl.data.source);
+      }
+      return newEl;
+    });
 
-    const layoutConfig: LayoutOptions = isTraceMode
-      ? ({ name: 'dagre', rankDir: 'LR', spacingFactor: 1.2, animate: true, animationDuration: 600 } as unknown as LayoutOptions)
-      : {
-          name: 'concentric', fit: true, padding: 50, minNodeSpacing: 60, animate: true, animationDuration: 800,
-          concentric: (node: NodeSingular) => {
-            if (node.data('isTarget')) return 100;
-            if (node.data('type') === 'HighRisk' || node.data('type') === 'Mixer') return 80;
-            return 10;
-          },
-          levelWidth: () => 1
-        };
+    // =====================================================================
+    // 📐 佈局引擎升級：全面採用 Dagre (有向無環圖) 階層佈局
+    // Design Decision: 將資金流向強制約束為「從左到右 (Left-to-Right)」的樹狀/網狀結構。
+    // Why: 完美呈現資金的流動方向。最左邊通常是資金源頭 (Source)，
+    //      隨著層數向右推進，可以清晰看見資金被「切碎分發 (剝皮鏈)」或是「匯聚 (混幣器)」。
+    // =====================================================================
+    const layoutConfig = {
+      name: 'dagre',
+      rankDir: 'LR',        // 核心設定：LR 代表 Left to Right (由左至右排列)
+      spacingFactor: 1.2,   // 節點整體的擴張倍率
+      nodeSep: 50,          // 垂直方向：同一層（上下）節點的間距
+      rankSep: 150,         // 水平方向：層與層（左右）之間的間距，拉開一點線條會更清楚
+      animate: true,
+      animationDuration: 800,
+    } as unknown as LayoutOptions;
 
     cyInstance.current = cytoscape({
       container: cyRef.current,
-      elements: elements,
+      elements: styledElements,
       minZoom: 0.1, maxZoom: 3,
       style: [
         {
           selector: 'node',
           style: {
-            'background-color': '#1E1E24', 'border-width': 1.5, 'border-color': '#444', 'label': 'data(label)',
-            'color': '#888', 'font-size': '11px', 'font-family': 'monospace', 'text-valign': 'bottom',
+            'background-color': 'data(color)', 
+            'border-width': 2, 
+            'border-color': '#111', 
+            'label': 'data(label)',
+            'color': '#CCC', 
+            'font-size': '11px', 'font-family': 'monospace', 'text-valign': 'bottom',
             'text-margin-y': 8, 'width': 44, 'height': 44,
           }
         },
         {
           selector: 'node[?isTarget]',
           style: {
-            'background-color': '#000', 'border-color': '#00E0FF', 'border-width': 3, 'width': 64, 'height': 64,
-            'underlay-color': '#00E0FF', 'underlay-padding': 15, 'underlay-opacity': 0.5, 'underlay-shape': 'ellipse', 'color': '#FFF'
+            'border-color': '#FFF', 
+            'border-width': 4, 'width': 64, 'height': 64,
+            'underlay-color': '#00E0FF', 'underlay-padding': 15, 'underlay-opacity': 0.8, 'underlay-shape': 'ellipse', 'color': '#FFF'
           }
         },
         {
           selector: 'node[type="Mixer"], node[type="risk"]',
           style: {
-            'background-color': '#1A0505', 'border-color': '#FF003C', 'shape': 'diamond', 'width': 54, 'height': 54,
-            'underlay-color': '#FF003C', 'underlay-padding': 12, 'underlay-opacity': 0.5, 'underlay-shape': 'round-rectangle',
+            'shape': 'diamond', 'width': 54, 'height': 54,
           }
         },
         {
           selector: 'node[type="HighRisk"]',
           style: {
-            'background-color': '#3a0000', 'border-color': '#FF3366', 'border-width': 2,
-            'underlay-color': '#FF003C', 'underlay-padding': 10, 'underlay-opacity': 0.6,
+            'background-opacity': 0.6,
+            'border-color': '#FF003C', 
+            'border-width': 4,
+            'underlay-color': '#FF003C', 'underlay-padding': 12, 'underlay-opacity': 0.9,
           }
         },
         {
           selector: 'edge',
           style: {
-            'width': 1.5, 'line-color': '#333', 'target-arrow-color': '#333', 'target-arrow-shape': 'triangle',
-            'curve-style': 'bezier', 'label': 'data(edgeLabel)', 'text-wrap': 'wrap', 'text-margin-y': -12,
+            'width': 2.5, 
+            'line-color': 'data(color)', 
+            'target-arrow-color': 'data(color)', 
+            'target-arrow-shape': 'triangle',
+            // 💡 配合 LR 佈局，建議將線條改為 taxi 或 bezier，這裡使用 bezier 會有漂亮的弧線
+            'curve-style': 'bezier', 
+            'label': 'data(edgeLabel)', 'text-wrap': 'wrap', 'text-margin-y': -12,
             'text-halign': 'center', 'text-valign': 'top', 'color': '#888', 'font-size': '9px', 'font-family': 'monospace',
             'text-background-opacity': 1, 'text-background-color': '#0A0A0A', 'text-background-padding': '4px',
-            'text-background-shape': 'roundrectangle', 'control-point-step-size': 40 
+            'text-background-shape': 'roundrectangle', 'control-point-step-size': 40,
+            'opacity': 0.85 
           }
         },
         {
           selector: 'edge[type="Trace"]',
-          style: { 'line-color': '#FF003C', 'target-arrow-color': '#FF003C', 'width': 2.5, 'color': '#FF003C' }
+          style: { 'line-color': '#FF003C', 'target-arrow-color': '#FF003C', 'width': 3.5, 'opacity': 1 }
         }
       ],
       layout: layoutConfig
     });
 
-    cyInstance.current.on('tap', 'node', function(evt) {
+    cyInstance.current.on('tap', 'node, edge', function(evt) {
       setQueryIdentifier(evt.target.id());
     });
-  }, [analysisMode]);
+  }, []);
 
   const handleForensicsAnalysis = async () => {
     if (!queryIdentifier) return;
@@ -165,14 +199,12 @@ export default function ForensicsDashboard() {
       const startTs = getUnixTimestamp(startDate);
       const endTs = getUnixTimestamp(endDate, true);
 
-      // 💡 將時間邊界包進 Payload 傳給後端
       await axios.post(endpoint, { 
         address: queryIdentifier,
         startTime: startTs,
         endTime: endTs
       });
       
-      // 💡 GET 請求透過 Query Parameters 傳遞時序約束
       const getGraphUrl = `${API_BASE_URL}/api/graph/${queryIdentifier}?start=${startTs}&end=${endTs}`;
       const response = await axios.get<GraphElement[]>(getGraphUrl);
       const topologyData = response.data;
@@ -277,7 +309,6 @@ export default function ForensicsDashboard() {
             />
           </div>
 
-          {/* 💡 企業級時間窗篩選器 */}
           <div className="flex gap-3 mb-6">
             <div className="flex-1 relative group">
               <div className="flex items-center gap-1.5 text-[10px] text-slate-500 mb-1 ml-1 uppercase tracking-widest font-bold">
@@ -388,13 +419,13 @@ export default function ForensicsDashboard() {
         <div className="bg-[#121216]/80 backdrop-blur-xl border border-white/10 rounded-xl p-5 min-w-[160px]">
           <div className="text-[10px] tracking-widest font-bold text-slate-500 uppercase mb-4">Topology Key</div>
           <div className="flex items-center gap-3 mb-3 text-xs font-mono text-slate-300">
-            <span className="w-2.5 h-2.5 rounded-full bg-[#00E0FF] shadow-[0_0_8px_#00E0FF]"></span> Subject (Target)
+            <span className="w-3 h-3 rounded-full border border-slate-600" style={{ background: 'linear-gradient(135deg, hsl(180, 85%, 65%), hsl(220, 85%, 65%))'}}></span> Entity Color
           </div>
           <div className="flex items-center gap-3 mb-3 text-xs font-mono text-slate-300">
-            <span className="w-2.5 h-2.5 rounded-full bg-[#3a0000] border border-[#FF3366] shadow-[0_0_8px_rgba(255,0,60,0.5)]"></span> AI High Risk
+            <span className="w-3 h-3 rounded-full bg-[#00E0FF] border-2 border-white shadow-[0_0_8px_#00E0FF]"></span> Target Subject
           </div>
           <div className="flex items-center gap-3 text-xs font-mono text-slate-300">
-            <span className="w-2.5 h-2.5 rounded-full bg-[#444] border border-slate-600"></span> Standard Node
+            <span className="w-3 h-3 rounded-full bg-slate-500/60 border-2 border-[#FF003C] shadow-[0_0_8px_rgba(255,0,60,0.8)]"></span> AI High Risk
           </div>
         </div>
       </div>
