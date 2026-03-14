@@ -4,19 +4,21 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
 import cytoscape, { Core, NodeSingular, LayoutOptions } from 'cytoscape';
 import dagre from 'cytoscape-dagre';
-import { Search, Activity, Share2, Target, ShieldAlert, Layers } from 'lucide-react';
+import { Search, Activity, Share2, Target, ShieldAlert, Layers, Calendar } from 'lucide-react';
 import { GraphElement, GraphNode, GraphEdge, AnalysisStats } from '@/types';
 
 if (typeof window !== 'undefined') {
-  try {
-    cytoscape.use(dagre);
-  } catch (e) {
-    console.error('Failed to load cytoscape-dagre layout:', e); 
+  try { cytoscape.use(dagre); } 
+  catch (e) {
+    console.error('Failed to load cytoscape-dagre layout extension:', e);
   }
 }
 
 export default function ForensicsDashboard() {
   const [queryIdentifier, setQueryIdentifier] = useState<string>('');
+  const [startDate, setStartDate] = useState<string>('');
+  const [endDate, setEndDate] = useState<string>('');
+  
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
   const [hasTopologyData, setHasTopologyData] = useState<boolean>(false);
   const [analysisMode, setAnalysisMode] = useState<'overview' | 'trace'>('overview');
@@ -26,11 +28,17 @@ export default function ForensicsDashboard() {
 
   const cyRef = useRef<HTMLDivElement>(null);
   const cyInstance = useRef<Core | null>(null);
-  
-  // ✨ 新增：利用 useRef 來追蹤「連續未變動次數」，不觸發不必要的渲染
   const unchangedCountRef = useRef<number>(0);
 
   const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://cryptotrace-backend-713204579643.us-central1.run.app';
+
+  // 💡 將 YYYY-MM-DD 轉為 Unix Timestamp 供後端使用
+  const getUnixTimestamp = useCallback((dateString: string, isEnd: boolean = false) => {
+    if (!dateString) return 0;
+    const date = new Date(dateString);
+    if (isEnd) date.setHours(23, 59, 59, 999);
+    return Math.floor(date.getTime() / 1000);
+  }, []);
 
   const getRiskGlowColor = (score: number) => {
     if (score >= 80) return 'text-[#FF003C] drop-shadow-[0_0_12px_rgba(255,0,60,0.6)]';
@@ -48,7 +56,6 @@ export default function ForensicsDashboard() {
         uniqueEntities.add(node.data.id);
         const isTarget = node.data.isTarget;
         const entityType = node.data.type;
-
         if (entityType === 'HighRisk' || entityType === 'Mixer') {
           computedRisk += isTarget ? 75 : 15;
         }
@@ -59,39 +66,20 @@ export default function ForensicsDashboard() {
     });
 
     computedRisk = Math.min(100, Math.max(0, computedRisk));
-    if (computedRisk === 0) {
-      computedRisk = currentMode === 'trace' ? 12 : 5; 
-    }
-
+    if (computedRisk === 0) computedRisk = currentMode === 'trace' ? 12 : 5; 
     return { computedRisk, entityCount: uniqueEntities.size };
   };
 
-  // =====================================================================
-  // Design Decision: 函式實例穩定化 (Function Memoization)
-  // Why: 消除 useEffect 的 missing dependencies 警告，並避免無窮迴圈渲染。
-  // =====================================================================
   const renderTopology = useCallback((elements: GraphElement[]) => {
     if (!cyRef.current) return;
     if (cyInstance.current) cyInstance.current.destroy();
 
     const isTraceMode = analysisMode === 'trace';
 
-    // Design Decision: 雙重斷言 (Double Casting) 繞過 no-explicit-any
     const layoutConfig: LayoutOptions = isTraceMode
-      ? ({
-          name: 'dagre',
-          rankDir: 'LR',
-          spacingFactor: 1.2,
-          animate: true,
-          animationDuration: 600,
-        } as unknown as LayoutOptions)
+      ? ({ name: 'dagre', rankDir: 'LR', spacingFactor: 1.2, animate: true, animationDuration: 600 } as unknown as LayoutOptions)
       : {
-          name: 'concentric',
-          fit: true,
-          padding: 50,
-          minNodeSpacing: 60,
-          animate: true,
-          animationDuration: 800,
+          name: 'concentric', fit: true, padding: 50, minNodeSpacing: 60, animate: true, animationDuration: 800,
           concentric: (node: NodeSingular) => {
             if (node.data('isTarget')) return 100;
             if (node.data('type') === 'HighRisk' || node.data('type') === 'Mixer') return 80;
@@ -103,104 +91,57 @@ export default function ForensicsDashboard() {
     cyInstance.current = cytoscape({
       container: cyRef.current,
       elements: elements,
-      minZoom: 0.1,
-      maxZoom: 3,
+      minZoom: 0.1, maxZoom: 3,
       style: [
         {
           selector: 'node',
           style: {
-            'background-color': '#1E1E24',
-            'border-width': 1.5,
-            'border-color': '#444',
-            'label': 'data(label)',
-            'color': '#888',
-            'font-size': '11px',
-            'font-family': 'monospace',
-            'text-valign': 'bottom',
-            'text-margin-y': 8,
-            'width': 44,
-            'height': 44,
+            'background-color': '#1E1E24', 'border-width': 1.5, 'border-color': '#444', 'label': 'data(label)',
+            'color': '#888', 'font-size': '11px', 'font-family': 'monospace', 'text-valign': 'bottom',
+            'text-margin-y': 8, 'width': 44, 'height': 44,
           }
         },
         {
           selector: 'node[?isTarget]',
           style: {
-            'background-color': '#000',
-            'border-color': '#00E0FF',
-            'border-width': 3,
-            'width': 64,
-            'height': 64,
-            'underlay-color': '#00E0FF',
-            'underlay-padding': 15,
-            'underlay-opacity': 0.5,
-            'underlay-shape': 'ellipse',
-            'color': '#FFF'
+            'background-color': '#000', 'border-color': '#00E0FF', 'border-width': 3, 'width': 64, 'height': 64,
+            'underlay-color': '#00E0FF', 'underlay-padding': 15, 'underlay-opacity': 0.5, 'underlay-shape': 'ellipse', 'color': '#FFF'
           }
         },
         {
           selector: 'node[type="Mixer"], node[type="risk"]',
           style: {
-            'background-color': '#1A0505',
-            'border-color': '#FF003C',
-            'shape': 'diamond',
-            'width': 54,
-            'height': 54,
-            'underlay-color': '#FF003C',
-            'underlay-padding': 12,
-            'underlay-opacity': 0.5,
-            'underlay-shape': 'round-rectangle',
+            'background-color': '#1A0505', 'border-color': '#FF003C', 'shape': 'diamond', 'width': 54, 'height': 54,
+            'underlay-color': '#FF003C', 'underlay-padding': 12, 'underlay-opacity': 0.5, 'underlay-shape': 'round-rectangle',
           }
         },
         {
           selector: 'node[type="HighRisk"]',
           style: {
-            'background-color': '#3a0000',
-            'border-color': '#FF3366',
-            'border-width': 2,
-            'underlay-color': '#FF003C',
-            'underlay-padding': 10,
-            'underlay-opacity': 0.6,
+            'background-color': '#3a0000', 'border-color': '#FF3366', 'border-width': 2,
+            'underlay-color': '#FF003C', 'underlay-padding': 10, 'underlay-opacity': 0.6,
           }
         },
         {
           selector: 'edge',
           style: {
-            'width': 1.5,
-            'line-color': '#333',
-            'target-arrow-color': '#333',
-            'target-arrow-shape': 'triangle',
-            'curve-style': 'bezier',
-            'label': 'data(edgeLabel)', 
-            'text-wrap': 'wrap',
-            'text-margin-y': -12,
-            'text-halign': 'center',
-            'text-valign': 'top',
-            'color': '#888',
-            'font-size': '9px',
-            'font-family': 'monospace',
-            'text-background-opacity': 1,
-            'text-background-color': '#0A0A0A',
-            'text-background-padding': '4px',
-            'text-background-shape': 'roundrectangle',
-            'control-point-step-size': 40 
+            'width': 1.5, 'line-color': '#333', 'target-arrow-color': '#333', 'target-arrow-shape': 'triangle',
+            'curve-style': 'bezier', 'label': 'data(edgeLabel)', 'text-wrap': 'wrap', 'text-margin-y': -12,
+            'text-halign': 'center', 'text-valign': 'top', 'color': '#888', 'font-size': '9px', 'font-family': 'monospace',
+            'text-background-opacity': 1, 'text-background-color': '#0A0A0A', 'text-background-padding': '4px',
+            'text-background-shape': 'roundrectangle', 'control-point-step-size': 40 
           }
         },
         {
           selector: 'edge[type="Trace"]',
-          style: {
-            'line-color': '#FF003C',
-            'target-arrow-color': '#FF003C',
-            'width': 2.5,
-            'color': '#FF003C',
-          }
+          style: { 'line-color': '#FF003C', 'target-arrow-color': '#FF003C', 'width': 2.5, 'color': '#FF003C' }
         }
       ],
       layout: layoutConfig
     });
 
     cyInstance.current.on('tap', 'node', function(evt) {
-      const node = evt.target;
-      setQueryIdentifier(node.id());
+      setQueryIdentifier(evt.target.id());
     });
   }, [analysisMode]);
 
@@ -221,14 +162,23 @@ export default function ForensicsDashboard() {
     try {
       const endpoint = analysisMode === 'trace' ? `${API_BASE_URL}/api/trace` : `${API_BASE_URL}/api/analyze`;
       
-      // 後端是 Fast-Return 架構，這裡只代表「第0層」完成，後端背景 Goroutine 還在跑
-      await axios.post(endpoint, { address: queryIdentifier });
+      const startTs = getUnixTimestamp(startDate);
+      const endTs = getUnixTimestamp(endDate, true);
+
+      // 💡 將時間邊界包進 Payload 傳給後端
+      await axios.post(endpoint, { 
+        address: queryIdentifier,
+        startTime: startTs,
+        endTime: endTs
+      });
       
-      const response = await axios.get<GraphElement[]>(`${API_BASE_URL}/api/graph/${queryIdentifier}`);
+      // 💡 GET 請求透過 Query Parameters 傳遞時序約束
+      const getGraphUrl = `${API_BASE_URL}/api/graph/${queryIdentifier}?start=${startTs}&end=${endTs}`;
+      const response = await axios.get<GraphElement[]>(getGraphUrl);
       const topologyData = response.data;
 
       if (!topologyData || topologyData.length === 0) {
-        setErrorMessage('No actionable data found for this identifier.');
+        setErrorMessage('No actionable data found in this time window.');
         setHasTopologyData(false);
         setLiveSyncState('synced');
         return;
@@ -239,7 +189,6 @@ export default function ForensicsDashboard() {
       setTimeout(() => renderTopology(topologyData), 200);
 
     } catch (error: unknown) {
-      console.error(error);
       if (axios.isAxiosError(error)) {
         setErrorMessage(error.response?.data?.error || 'Analysis engine failure.');
       } else {
@@ -252,18 +201,16 @@ export default function ForensicsDashboard() {
     }
   };
 
-  // =====================================================================
-  // 即時資料流與閒置偵測 (Live Sync & Idle Detection)
-  // Design Decision: 透過比較前後狀態來決定何時停止輪詢。
-  // Why: 因為後端是背景非同步運算，前端每 8 秒拉一次。若連續 15 次 (120秒) 
-  //      資料都沒有新增，且 AI 風險分數也結算了，才視為同步完成 (SYNCED)。
-  // =====================================================================
   useEffect(() => {
     let pollingIntervalId: NodeJS.Timeout;
 
     const fetchLatestTopology = async () => {
       try {
-        const response = await axios.get<GraphElement[]>(`${API_BASE_URL}/api/graph/${queryIdentifier}`);
+        const startTs = getUnixTimestamp(startDate);
+        const endTs = getUnixTimestamp(endDate, true);
+        const getGraphUrl = `${API_BASE_URL}/api/graph/${queryIdentifier}?start=${startTs}&end=${endTs}`;
+        
+        const response = await axios.get<GraphElement[]>(getGraphUrl);
         const topologyData = response.data;
 
         if (topologyData && topologyData.length > 0) {
@@ -271,16 +218,12 @@ export default function ForensicsDashboard() {
 
           setDashboardMetrics(prevMetrics => {
             if (prevMetrics.nodeCount !== entityCount || prevMetrics.riskScore !== computedRisk) {
-              // 有新進度！重置計數器，並重新渲染圖表
               unchangedCountRef.current = 0; 
               setTimeout(() => renderTopology(topologyData), 100);
               return { ...prevMetrics, nodeCount: entityCount, riskScore: computedRisk };
             } else {
-              // 沒新進度！累加閒置次數
               unchangedCountRef.current += 1;
-              if (unchangedCountRef.current >= 15) {
-                setLiveSyncState('synced'); // 等待超過兩分鐘無動靜，判定為後端運算徹底結束
-              }
+              if (unchangedCountRef.current >= 15) setLiveSyncState('synced');
               return prevMetrics;
             }
           });
@@ -297,7 +240,7 @@ export default function ForensicsDashboard() {
     return () => {
       if (pollingIntervalId) clearInterval(pollingIntervalId);
     };
-  }, [hasTopologyData, analysisMode, queryIdentifier, liveSyncState, API_BASE_URL, renderTopology]);
+  }, [hasTopologyData, analysisMode, queryIdentifier, liveSyncState, API_BASE_URL, renderTopology, startDate, endDate, getUnixTimestamp]);
 
   const centerTopologyView = () => cyInstance.current?.fit(cyInstance.current.elements(), 50);
 
@@ -314,14 +257,14 @@ export default function ForensicsDashboard() {
 
       <div className="absolute top-8 left-8 z-20 w-[400px] flex flex-col gap-6">
         <div className="bg-[#121216]/80 backdrop-blur-xl border border-white/10 rounded-xl p-6 shadow-2xl">
-          <div className="flex items-center gap-3 mb-8">
+          <div className="flex items-center gap-3 mb-6">
             <ShieldAlert className="text-[#00E0FF]" size={28} />
             <h1 className="text-xl font-bold tracking-[0.2em] text-white">
               CRYPTO<span className="text-[#00E0FF]">TRACE</span>
             </h1>
           </div>
 
-          <div className="relative mb-6 group">
+          <div className="relative mb-4 group">
             <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 group-focus-within:text-[#00E0FF] transition-colors" size={18} />
             <input
               type="text"
@@ -332,6 +275,34 @@ export default function ForensicsDashboard() {
               onKeyDown={(e) => e.key === 'Enter' && handleForensicsAnalysis()}
               spellCheck={false}
             />
+          </div>
+
+          {/* 💡 企業級時間窗篩選器 */}
+          <div className="flex gap-3 mb-6">
+            <div className="flex-1 relative group">
+              <div className="flex items-center gap-1.5 text-[10px] text-slate-500 mb-1 ml-1 uppercase tracking-widest font-bold">
+                <Calendar size={10} className="text-[#00E0FF]" /> Start Date
+              </div>
+              <input
+                type="date"
+                style={{ colorScheme: 'dark' }}
+                className="w-full bg-black/50 border border-white/10 rounded-lg py-2.5 px-3 text-xs font-mono text-slate-300 focus:outline-none focus:border-[#00E0FF]/50 focus:ring-1 focus:ring-[#00E0FF]/50 transition-all cursor-pointer"
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+              />
+            </div>
+            <div className="flex-1 relative group">
+              <div className="flex items-center gap-1.5 text-[10px] text-slate-500 mb-1 ml-1 uppercase tracking-widest font-bold">
+                <Calendar size={10} className="text-[#00E0FF]" /> End Date
+              </div>
+              <input
+                type="date"
+                style={{ colorScheme: 'dark' }}
+                className="w-full bg-black/50 border border-white/10 rounded-lg py-2.5 px-3 text-xs font-mono text-slate-300 focus:outline-none focus:border-[#00E0FF]/50 focus:ring-1 focus:ring-[#00E0FF]/50 transition-all cursor-pointer"
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+              />
+            </div>
           </div>
 
           <div className="grid grid-cols-2 gap-3">
@@ -360,7 +331,7 @@ export default function ForensicsDashboard() {
           </div>
 
           {errorMessage && (
-            <div className="mt-6 p-3 bg-red-950/40 border border-red-500/30 rounded-lg text-red-400 text-xs font-mono text-center">
+            <div className="mt-4 p-3 bg-red-950/40 border border-red-500/30 rounded-lg text-red-400 text-xs font-mono text-center">
               {errorMessage}
             </div>
           )}

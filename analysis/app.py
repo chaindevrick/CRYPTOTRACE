@@ -33,6 +33,10 @@ def health_check() -> tuple[Dict[str, str], int]:
 def analyze_wallet_behavior() -> tuple[Dict[str, Any], int]:
     payload = request.json
     target_wallet_address = payload.get('address', '').lower()
+    
+    # 💡 獲取前端傳遞的時間窗約束 (預設為 0 代表全時段)
+    start_time = payload.get('startTime', 0)
+    end_time = payload.get('endTime', 0)
 
     if not target_wallet_address:
         return jsonify({"error": "Missing target address"}), 400
@@ -44,7 +48,7 @@ def analyze_wallet_behavior() -> tuple[Dict[str, Any], int]:
 
     try:
         # =====================================================================
-        # PHASE 1 & 2: Entity Whitelisting & Local Context Retrieval
+        # PHASE 1: Entity Whitelisting
         # =====================================================================
         cursor.execute("SELECT label FROM wallets WHERE address = %s", (target_wallet_address,))
         row = cursor.fetchone()
@@ -54,27 +58,57 @@ def analyze_wallet_behavior() -> tuple[Dict[str, Any], int]:
             print(f"🛡️ [AI Engine] Execution halted: Target is a verified entity ({entity_label}).", flush=True)
             return jsonify({"status": "exempt", "anomalies_found": 0, "anomaly_details": []}), 200
 
-        ego_network_query = """
-            WITH RECURSIVE ego_network AS (
-                SELECT %s::varchar AS address, 0 AS depth
-                UNION
-                SELECT 
-                    CASE WHEN t.from_address = c.address THEN t.to_address ELSE t.from_address END, 
-                    c.depth + 1
-                FROM transactions t 
-                JOIN ego_network c ON (t.from_address = c.address OR t.to_address = c.address)
-                JOIN wallets w ON c.address = w.address
-                WHERE c.depth < 2 AND (w.label IN ('wallet', 'HighRisk') OR c.depth = 0)
-            )
-            SELECT hash, from_address, to_address, amount, timestamp, type 
-            FROM transactions 
-            WHERE from_address IN (SELECT address FROM ego_network) 
-               OR to_address IN (SELECT address FROM ego_network)
-        """
+        # =====================================================================
+        # PHASE 2: Adaptive Baseline Expansion (自適應基線擴展)
+        # Design Decision: 動態決定歷史資料的抓取範圍，避免樣本稀疏與概念漂移。
+        # =====================================================================
+        MIN_SAMPLES_REQUIRED = 50
+        INITIAL_LOOKBACK_DAYS = 30
+        MAX_LOOKBACK_DAYS = 90
+        
+        # 為了計算特徵 (如 24h 滾動頻率)，強迫將查詢起點往前推，作為模型「預熱期」
+        training_start_time = start_time - (INITIAL_LOOKBACK_DAYS * 24 * 3600) if start_time > 0 else 0
 
-        local_context_tx_df = pd.read_sql(ego_network_query, conn, params=(target_wallet_address,))
+        def fetch_ego_network(t_start, t_end):
+            """內部閉包函式：封裝 SQL 查詢，支援動態時間重試"""
+            query = """
+                WITH RECURSIVE ego_network AS (
+                    SELECT %s::varchar AS address, 0 AS depth
+                    UNION
+                    SELECT CASE WHEN t.from_address = c.address THEN t.to_address ELSE t.from_address END, c.depth + 1
+                    FROM transactions t 
+                    JOIN ego_network c ON (t.from_address = c.address OR t.to_address = c.address)
+                    JOIN wallets w ON c.address = w.address
+                    WHERE c.depth < 2 AND (w.label IN ('wallet', 'HighRisk') OR c.depth = 0)
+                    AND (%s::bigint = 0 OR t.timestamp >= %s)
+                    AND (%s::bigint = 0 OR t.timestamp <= %s)
+                )
+                SELECT hash, from_address, to_address, amount, timestamp, type 
+                FROM transactions 
+                WHERE from_address IN (SELECT address FROM ego_network) 
+                   OR to_address IN (SELECT address FROM ego_network)
+            """
+            import warnings
+            # 忽略 pandas 針對 DBAPI2 的警告，保持程式碼乾淨
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', UserWarning)
+                return pd.read_sql(query, conn, params=(
+                    target_wallet_address, 
+                    t_start, t_start, 
+                    t_end, t_end
+                ))
+
+        # 第一次嘗試：抓取 30 天的預熱資料
+        local_context_tx_df = fetch_ego_network(training_start_time, end_time)
+
+        # 核心防禦：如果 30 天內資料太少，自適應擴展到 90 天
+        if start_time > 0 and len(local_context_tx_df) < MIN_SAMPLES_REQUIRED:
+            print(f"⚠️ [AI Engine] Sparse data ({len(local_context_tx_df)} edges). Expanding lookback to {MAX_LOOKBACK_DAYS} days...", flush=True)
+            extended_start_time = start_time - (MAX_LOOKBACK_DAYS * 24 * 3600)
+            local_context_tx_df = fetch_ego_network(extended_start_time, end_time)
 
         if local_context_tx_df.empty or len(local_context_tx_df) < 5:
+            print(f"🛑 [AI Engine] Insufficient graph density for ML. Halting.", flush=True)
             return jsonify({"status": "insufficient_data", "anomalies_found": 0, "anomaly_details": []}), 200
 
         # =====================================================================
@@ -97,29 +131,32 @@ def analyze_wallet_behavior() -> tuple[Dict[str, Any], int]:
         isolation_forest_model = IsolationForest(contamination='auto', random_state=42) 
         isolation_forest_model.fit(baseline_feature_matrix)
 
+        # 計算整個預熱期 + 時間窗的網路動態天花板
+        amount_95th = np.percentile(local_context_tx_df['amount'], 95)
+        freq_95th = np.percentile(local_context_tx_df['tx_freq_24h'], 95)
+
         # =====================================================================
-        # PHASE 5: Explainable AI (XAI) - Model-Driven Anomaly Detection
-        # Design Decision: 信任 ML 模型，捨棄人工寫死的硬性邊界 (Hardcoded Thresholds)。
-        # Why: Isolation Forest 會自動在高維度空間 (金額 x 時間差 x 頻率) 找出孤立點。
-        #      我們不再用 "amount > 5x median" 來決定異常，而是將 ML 標記 (-1) 視為唯一真理。
-        #      底下的邏輯純粹是為了產生「法遵報告 (Compliance Report)」，
-        #      利用 95 百分位數 (95th Percentile) 向人類解釋模型為什麼抓出這筆交易。
+        # PHASE 5: Temporal Slicing & XAI Verification (時序切割與可解釋性 AI)
+        # Design Decision: 訓練完成後，我們只把「使用者真正關心的時間窗」切出來做推論。
         # =====================================================================
         target_wallet_mask = (local_context_tx_df['from_address'] == target_wallet_address) | (local_context_tx_df['to_address'] == target_wallet_address)
         target_tx_df = local_context_tx_df[target_wallet_mask].copy()
+
+        # 💡 嚴格剔除預熱期的資料，只留下使用者指定的時間窗
+        if start_time > 0:
+            target_tx_df = target_tx_df[target_tx_df['timestamp'] >= start_time]
+        if end_time > 0:
+            target_tx_df = target_tx_df[target_tx_df['timestamp'] <= end_time]
         
         if target_tx_df.empty:
-            return jsonify({"status": "no_target_data", "anomalies_found": 0, "anomaly_details": []}), 200
+            print("✅ [AI Engine] Target wallet has no activity within the specified time window.", flush=True)
+            return jsonify({"status": "no_target_data_in_window", "anomalies_found": 0, "anomaly_details": []}), 200
 
         target_feature_matrix = target_tx_df[feature_columns].values
         
         # 👑 唯一的判斷標準：讓 ML 模型說了算
         target_tx_df['ai_label'] = isolation_forest_model.predict(target_feature_matrix)
         target_tx_df['anomaly_score'] = isolation_forest_model.decision_function(target_feature_matrix) 
-
-        # 計算局部生態的統計動態天花板，專供 XAI 報表翻譯使用
-        amount_95th = np.percentile(local_context_tx_df['amount'], 95)
-        freq_95th = np.percentile(local_context_tx_df['tx_freq_24h'], 95)
 
         def extract_compliance_reasons(row: pd.Series) -> List[str]:
             reasons = []
@@ -128,11 +165,11 @@ def analyze_wallet_behavior() -> tuple[Dict[str, Any], int]:
             if row['ai_label'] != -1: 
                 return reasons
             
-            # 灰塵過濾 (Dusting Filter)：即使模型覺得異常，但低於 3000 U 的微小雜訊仍不予起訴
+            # 灰塵過濾 (Dusting Filter)：忽略 3000 U 以下的微小雜訊
             if row['amount'] < 3000: 
                 return reasons 
                 
-            # XAI 翻譯層：模型判定異常了，我們來告訴法遵人員「模型可能看到了什麼特徵」
+            # XAI 翻譯層：向法遵人員解釋模型可能看到了什麼特徵
             if row['amount'] > amount_95th:
                 reasons.append(f"ML Insight: Volume ({row['amount']:.2f} U) exceeds network 95th percentile")
             
@@ -142,15 +179,13 @@ def analyze_wallet_behavior() -> tuple[Dict[str, Any], int]:
             if row['tx_freq_24h'] > freq_95th:
                 reasons.append(f"ML Insight: Frequency ({int(row['tx_freq_24h'])} txs/24h) exceeds network 95th percentile")
             
-            # 邊緣情況：如果模型標記了，但上述單一維度都沒突破 95%，代表這是多維度結構性異常
+            # 邊緣情況：若單一維度都沒破 95%，代表這是多維度結構性異常
             if not reasons:
                 reasons.append(f"ML Insight: Multi-dimensional structural anomaly (Score: {row['anomaly_score']:.3f})")
 
             return reasons
 
         target_tx_df['compliance_reasons'] = target_tx_df.apply(extract_compliance_reasons, axis=1)
-        
-        # 只要 reasons 裡有資料，就確認為可起訴的異常
         target_tx_df['is_verified_anomaly'] = target_tx_df['compliance_reasons'].apply(lambda x: len(x) > 0)
         verified_anomalies_count = int(target_tx_df['is_verified_anomaly'].sum())
         
@@ -177,7 +212,7 @@ def analyze_wallet_behavior() -> tuple[Dict[str, Any], int]:
             print(f"🚨 [AI] Classification Complete: {verified_anomalies_count} illicit signatures detected. Entity {target_wallet_address} marked as HighRisk.", flush=True)
             for detail in compliance_report:
                 reason_str = " | ".join(detail['reasons'])
-                print(f"   👉 Tx: {detail['tx_hash'][:12]}... | Amount: {detail['amount']:,.2f} U | Triggers: {reason_str}", flush=True)
+                print(f"   👉 Tx: {detail['tx_hash']} | Amount: {detail['amount']:,.2f} U | Triggers: {reason_str}", flush=True)
         else:
             print(f"✅ [AI] Classification Complete: Normal behavioral distribution (0/{len(target_tx_df)} anomalies).", flush=True)
 

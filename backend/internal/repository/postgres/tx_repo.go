@@ -89,16 +89,12 @@ func (r *txRepository) ResolveLabel(ctx context.Context, address string) string 
 // Why: ORM (如 GORM) 無法有效編譯複雜的遞迴查詢。為了壓榨 PostgreSQL 
 //      的圖論遍歷效能，直接編寫最佳化的 CTE 是唯一且最專業的解法。
 // =====================================================================
-func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool) ([]domain.CytoElement, error) {
+func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool, startTime, endTime int64) ([]domain.CytoElement, error) {
 	var query string
 	var args []interface{}
 
 	if isTxHash {
-		// ==========================================
-		// 🎯 FLOW 模式：線性時間序列追蹤
-		// Design Decision: 利用遞迴 CTE 結合時間戳 (timestamp >= p.timestamp) 
-		// 防止時空錯亂的髒款回流，確保資金流向的邏輯正確性。
-		// ==========================================
+		// FLOW 模式 (以單一 Tx 追蹤，通常不需時間限制，因為本身就是從該時序出發)
 		query = `
             WITH RECURSIVE trace_path AS (
                 SELECT hash, from_address, to_address, amount, timestamp, token, type
@@ -122,13 +118,7 @@ func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool
         `
 		args = []interface{}{input}
 	} else {
-		// ==========================================
-		// 🕸️ BROAD 模式：引力排序演算法 (Proximity Sorting)
-		// Design Decision: 解決大型網路視覺化時的「隨機截斷 (Random Eviction)」問題。
-		// Why: 當關聯交易超過 LIMIT 250 時，傳統的 ORDER BY 會隨機丟棄資料，
-		//      導致核心節點的連線破裂。透過計算 min_depth (最短跳數)，
-		//      我們強迫資料庫優先保留最靠近中心目標 (Target) 的交易，確保畫面由內而外穩定生長。
-		// ==========================================
+		// BROAD 模式 (N-Degree 拓撲發散，套用嚴格時間窗)
 		startAddress := input
 		query = `
             WITH RECURSIVE connected_nodes AS (
@@ -140,8 +130,10 @@ func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool
                 FROM transactions t 
                 JOIN connected_nodes c ON (t.from_address = c.address OR t.to_address = c.address)
                 JOIN wallets w ON c.address = w.address
-                -- 防禦性設計：當觸及已知的高流動性實體 (HighRisk 或預設 wallet 以外) 時，強制停止擴散 (Stop-Loss)
                 WHERE c.depth < 3 AND (w.label IN ('wallet', 'HighRisk') OR c.depth = 0)
+                -- 💡 時間邊界約束：過濾掉不在期間內的舊資料
+                AND ($2::bigint = 0 OR t.timestamp >= $2)
+                AND ($3::bigint = 0 OR t.timestamp <= $3)
             ),
             min_depth_nodes AS (
                 SELECT address, MIN(depth) as depth FROM connected_nodes GROUP BY address
@@ -157,7 +149,7 @@ func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool
             ORDER BY LEAST(n1.depth, n2.depth) ASC, t.timestamp DESC
             LIMIT 250; 
         `
-		args = []interface{}{startAddress}
+		args = []interface{}{startAddress, startTime, endTime}
 	}
 
 	rows, err := r.db.QueryContext(ctx, query, args...)
@@ -166,10 +158,7 @@ func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool
 	}
 	defer rows.Close()
 
-	// =====================================================================
-	// 資料轉型層 (Data Mapping)
-	// Design Decision: 將關聯式資料列轉換為 Cytoscape.js 的 Node 與 Edge 陣列。
-	// =====================================================================
+    // ... (以下資料轉型層代碼完全不變，維持原樣) ...
 	var elements []domain.CytoElement
 	addedNodes := make(map[string]bool)
 
@@ -182,13 +171,11 @@ func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool
 			continue
 		}
 
-		// 處理發送方節點 (Source Node)
 		if !addedNodes[fromAddr] {
 			displayLabel := fromAddr
 			if len(fromAddr) >= 10 {
 				displayLabel = fromAddr[:6] + "..." + fromAddr[len(fromAddr)-4:]
 			}
-			// 若有具體情報標籤，則覆蓋預設地址
 			if fromLabel != "wallet" && fromLabel != "HighRisk" && fromLabel != "Mixer" {
 				displayLabel = fromLabel
 			}
@@ -200,7 +187,6 @@ func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool
 			addedNodes[fromAddr] = true
 		}
 
-		// 處理接收方節點 (Target Node)
 		if !addedNodes[toAddr] {
 			displayLabel := toAddr
 			if len(toAddr) >= 10 {
@@ -217,7 +203,6 @@ func (r *txRepository) GetGraph(ctx context.Context, input string, isTxHash bool
 			addedNodes[toAddr] = true
 		}
 
-		// 處理連線 (Edge)
 		timeStr := time.Unix(timestamp, 0).Format("01/02 15:04")
 		formattedAmount := fmt.Sprintf("%.2f %s", amount, token)
 		edgeLabel := fmt.Sprintf("%s\n🕒 %s", formattedAmount, timeStr)
