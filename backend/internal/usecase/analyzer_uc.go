@@ -6,6 +6,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"backend/internal/domain"
@@ -13,14 +14,24 @@ import (
 
 type analyzerUsecase struct {
 	BaseUsecase
+	syncState sync.Map
 }
 
 func NewAnalyzerUsecase(base BaseUsecase) domain.AnalyzerUsecase {
 	return &analyzerUsecase{BaseUsecase: base}
 }
 
+func (uc *analyzerUsecase) GetStatus(ctx context.Context, address string) string {
+	val, ok := uc.syncState.Load(strings.ToLower(address))
+	if !ok {
+		return "synced"
+	}
+	return val.(string)
+}
+
 func (uc *analyzerUsecase) Analyze(ctx context.Context, targetAddress string, startTime, endTime int64) (int, error) {
 	targetAddress = strings.ToLower(targetAddress)
+	uc.syncState.Store(targetAddress, "syncing")
 
 	maxDepth := 3          
 	maxTxPerAddress := 50  
@@ -28,6 +39,7 @@ func (uc *analyzerUsecase) Analyze(ctx context.Context, targetAddress string, st
 
 	txs, err := uc.EtherscanRepo.GetTokenTxs(ctx, targetAddress, "desc")
 	if err != nil {
+		uc.syncState.Store(targetAddress, "failed")
 		return 0, fmt.Errorf("獲取目標節點交易失敗: %w", err)
 	}
 
@@ -36,14 +48,10 @@ func (uc *analyzerUsecase) Analyze(ctx context.Context, targetAddress string, st
 	exploredNodes[targetAddress] = true
 	var nextHopCandidates []string 
 
-	// =====================================================================
-	// 🚀 PHASE 1: 同步執行 (第 0 層)
-	// Design Decision: Filter-Then-Limit (先過濾後限制)
-	// =====================================================================
-	for _, tx := range txs { // 💡 修正：遍歷所有交易，不再預先切片 [:limit]
+	// PHASE 1: 同步執行 (Filter-Then-Limit)
+	for _, tx := range txs {
 		timestamp, _ := strconv.ParseInt(tx.TimeStamp, 10, 64)
 
-		// ⏳ 時序邊界剪枝
 		if startTime > 0 && timestamp < startTime { continue }
 		if endTime > 0 && timestamp > endTime { continue }
 
@@ -53,16 +61,13 @@ func (uc *analyzerUsecase) Analyze(ctx context.Context, targetAddress string, st
 		amount := uc.FormatAmount(tx.Value)
 		if amount <= 0 { continue }
 
-		// 💡 修正：找到符合條件的交易後，才檢查是否已達上限
-		if immediateTxCount >= maxTxPerAddress {
-			break
-		}
+		if immediateTxCount >= maxTxPerAddress { break }
 
 		from := strings.ToLower(tx.From)
 		to := strings.ToLower(tx.To)
 
 		if err := uc.TxRepo.UpsertTx(ctx, from, to, tx.Hash, tokenName, "TRANSFER", amount, timestamp); err == nil {
-			immediateTxCount++ // 成功寫入才計數
+			immediateTxCount++
 		}
 
 		if from != targetAddress && !exploredNodes[from] {
@@ -75,11 +80,9 @@ func (uc *analyzerUsecase) Analyze(ctx context.Context, targetAddress string, st
 		}
 	}
 
-	log.Printf("🎯 [Crawler] 第 0 層 (目標節點) 建立完成，找到 %d 筆符合時間窗的交易。", immediateTxCount)
+	log.Printf("🎯 [Crawler] 第 0 層建立完成，找到 %d 筆符合時間窗的交易。", immediateTxCount)
 
-	// =====================================================================
-	// 🚀 PHASE 2: 背景執行緒 (深層網路)
-	// =====================================================================
+	// PHASE 2: 背景深層網路
 	if immediateTxCount > 0 && maxDepth > 0 {
 		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 
@@ -97,12 +100,11 @@ func (uc *analyzerUsecase) Analyze(ctx context.Context, targetAddress string, st
 					bgTxs, err := uc.EtherscanRepo.GetTokenTxs(bgCtx, addr, "desc")
 					if err != nil { continue }
 
-					validBgCount := 0 // 💡 修正：背景爬蟲也必須擁有獨立的有效計數器
+					validBgCount := 0
 
-					for _, tx := range bgTxs { // 💡 修正：遍歷所有交易
+					for _, tx := range bgTxs {
 						timestamp, _ := strconv.ParseInt(tx.TimeStamp, 10, 64)
 						
-						// ⏳ 時序邊界剪枝
 						if startTime > 0 && timestamp < startTime { continue }
 						if endTime > 0 && timestamp > endTime { continue }
 
@@ -112,10 +114,7 @@ func (uc *analyzerUsecase) Analyze(ctx context.Context, targetAddress string, st
 						amount := uc.FormatAmount(tx.Value)
 						if amount <= 0 { continue }
 
-						// 💡 修正：找到符合條件的才檢查上限
-						if validBgCount >= maxTxPerAddress {
-							break
-						}
+						if validBgCount >= maxTxPerAddress { break }
 
 						from := strings.ToLower(tx.From)
 						to := strings.ToLower(tx.To)
@@ -124,7 +123,7 @@ func (uc *analyzerUsecase) Analyze(ctx context.Context, targetAddress string, st
 							totalBackgroundSaved++
 						}
 						
-						validBgCount++ // 計數增加
+						validBgCount++
 
 						if depth < maxDepth {
 							if !currentVisited[from] {
@@ -144,10 +143,20 @@ func (uc *analyzerUsecase) Analyze(ctx context.Context, targetAddress string, st
 				queue = nextQueue
 			}
 
-			log.Printf("✅ [Crawler] 深層網路建立完成！共儲存 %d 筆關聯交易。準備觸發 AI...", totalBackgroundSaved)
-			_ = uc.AIRepo.TriggerAnalysis(bgCtx, targetAddress, startTime, endTime)
+			log.Printf("✅ [Crawler] 深層網路建立完成！準備觸發 AI...")
+			err := uc.AIRepo.TriggerAnalysis(bgCtx, targetAddress, startTime, endTime)
+			
+			if err != nil {
+				log.Printf("❌ [AI Engine] 分析失敗: %v", err)
+				uc.syncState.Store(targetAddress, "failed")
+			} else {
+				log.Printf("🎯 [AI Engine] 分析完美結束！解鎖前端 UI 狀態。")
+				uc.syncState.Store(targetAddress, "synced")
+			}
 
 		}(nextHopCandidates, exploredNodes)
+	} else {
+		uc.syncState.Store(targetAddress, "synced")
 	}
 
 	return immediateTxCount, nil

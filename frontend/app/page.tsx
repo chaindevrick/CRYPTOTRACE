@@ -2,20 +2,15 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
-import cytoscape, { Core, NodeSingular, LayoutOptions } from 'cytoscape';
+import cytoscape, { Core, LayoutOptions } from 'cytoscape';
 import dagre from 'cytoscape-dagre';
-import { Search, Activity, Share2, Target, ShieldAlert, Layers, Calendar } from 'lucide-react';
+import { Search, Activity, Share2, Target, ShieldAlert, Calendar } from 'lucide-react';
 import { GraphElement, GraphNode, GraphEdge, AnalysisStats } from '@/types';
 
 if (typeof window !== 'undefined') {
   try { cytoscape.use(dagre); } catch (e) {}
 }
 
-// =====================================================================
-// 🎨 色彩產生器 (Hash-to-Color)
-// Design Decision: 將字串雜湊為 HSL 色碼。
-// Why: 確保同一個地址永遠配對同一個顏色，且 S=85%, L=65% 確保在深色模式下非常亮眼。
-// =====================================================================
 const stringToColor = (str: string) => {
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
@@ -39,7 +34,6 @@ export default function ForensicsDashboard() {
 
   const cyRef = useRef<HTMLDivElement>(null);
   const cyInstance = useRef<Core | null>(null);
-  const unchangedCountRef = useRef<number>(0);
 
   const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'https://cryptotrace-backend-713204579643.us-central1.run.app';
 
@@ -80,7 +74,7 @@ export default function ForensicsDashboard() {
     return { computedRisk, entityCount: uniqueEntities.size };
   };
 
-const renderTopology = useCallback((elements: GraphElement[]) => {
+  const renderTopology = useCallback((elements: GraphElement[]) => {
     if (!cyRef.current) return;
     if (cyInstance.current) cyInstance.current.destroy();
 
@@ -94,18 +88,12 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
       return newEl;
     });
 
-    // =====================================================================
-    // 📐 佈局引擎升級：全面採用 Dagre (有向無環圖) 階層佈局
-    // Design Decision: 將資金流向強制約束為「從左到右 (Left-to-Right)」的樹狀/網狀結構。
-    // Why: 完美呈現資金的流動方向。最左邊通常是資金源頭 (Source)，
-    //      隨著層數向右推進，可以清晰看見資金被「切碎分發 (剝皮鏈)」或是「匯聚 (混幣器)」。
-    // =====================================================================
     const layoutConfig = {
       name: 'dagre',
-      rankDir: 'LR',        // 核心設定：LR 代表 Left to Right (由左至右排列)
-      spacingFactor: 1.2,   // 節點整體的擴張倍率
-      nodeSep: 50,          // 垂直方向：同一層（上下）節點的間距
-      rankSep: 150,         // 水平方向：層與層（左右）之間的間距，拉開一點線條會更清楚
+      rankDir: 'LR',
+      spacingFactor: 1.2,
+      nodeSep: 50,
+      rankSep: 150,
       animate: true,
       animationDuration: 800,
     } as unknown as LayoutOptions;
@@ -136,9 +124,23 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
           }
         },
         {
-          selector: 'node[type="Mixer"], node[type="risk"]',
+          selector: 'node[type="Mixer"], node[type="risk"], node[type="cex"]',
           style: {
-            'shape': 'diamond', 'width': 54, 'height': 54,
+            'shape': 'round-rectangle', 'width': 50, 'height': 50,
+          }
+        },
+        {
+          selector: 'node[type="dex"]',
+          style: {
+            'shape': 'hexagon', 'width': 50, 'height': 50,
+          }
+        },
+        {
+          selector: 'node[type="bridge"]',
+          style: {
+            'shape': 'octagon', 'width': 55, 'height': 55,
+            'border-width': 3, 'border-color': '#B58900',
+            'underlay-color': '#B58900', 'underlay-padding': 8, 'underlay-opacity': 0.4,
           }
         },
         {
@@ -157,7 +159,6 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
             'line-color': 'data(color)', 
             'target-arrow-color': 'data(color)', 
             'target-arrow-shape': 'triangle',
-            // 💡 配合 LR 佈局，建議將線條改為 taxi 或 bezier，這裡使用 bezier 會有漂亮的弧線
             'curve-style': 'bezier', 
             'label': 'data(edgeLabel)', 'text-wrap': 'wrap', 'text-margin-y': -12,
             'text-halign': 'center', 'text-valign': 'top', 'color': '#888', 'font-size': '9px', 'font-family': 'monospace',
@@ -177,7 +178,7 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
     cyInstance.current.on('tap', 'node, edge', function(evt) {
       setQueryIdentifier(evt.target.id());
     });
-  }, []);
+  }, []); 
 
   const handleForensicsAnalysis = async () => {
     if (!queryIdentifier) return;
@@ -186,7 +187,6 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
     setErrorMessage(null);
     setLiveSyncState('syncing'); 
     setHasTopologyData(true); 
-    unchangedCountRef.current = 0;
     
     if (cyInstance.current) {
       cyInstance.current.destroy();
@@ -195,7 +195,6 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
 
     try {
       const endpoint = analysisMode === 'trace' ? `${API_BASE_URL}/api/trace` : `${API_BASE_URL}/api/analyze`;
-      
       const startTs = getUnixTimestamp(startDate);
       const endTs = getUnixTimestamp(endDate, true);
 
@@ -206,8 +205,8 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
       });
       
       const getGraphUrl = `${API_BASE_URL}/api/graph/${queryIdentifier}?start=${startTs}&end=${endTs}`;
-      const response = await axios.get<GraphElement[]>(getGraphUrl);
-      const topologyData = response.data;
+      const response = await axios.get<{status: string, elements: GraphElement[]}>(getGraphUrl);
+      const topologyData = response.data.elements;
 
       if (!topologyData || topologyData.length === 0) {
         setErrorMessage('No actionable data found in this time window.');
@@ -242,24 +241,27 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
         const endTs = getUnixTimestamp(endDate, true);
         const getGraphUrl = `${API_BASE_URL}/api/graph/${queryIdentifier}?start=${startTs}&end=${endTs}`;
         
-        const response = await axios.get<GraphElement[]>(getGraphUrl);
-        const topologyData = response.data;
+        const response = await axios.get<{status: string, elements: GraphElement[]}>(getGraphUrl);
+        const { status, elements: topologyData } = response.data;
 
         if (topologyData && topologyData.length > 0) {
           const { computedRisk, entityCount } = computeRiskMetrics(topologyData, analysisMode);
 
           setDashboardMetrics(prevMetrics => {
             if (prevMetrics.nodeCount !== entityCount || prevMetrics.riskScore !== computedRisk) {
-              unchangedCountRef.current = 0; 
               setTimeout(() => renderTopology(topologyData), 100);
               return { ...prevMetrics, nodeCount: entityCount, riskScore: computedRisk };
-            } else {
-              unchangedCountRef.current += 1;
-              if (unchangedCountRef.current >= 15) setLiveSyncState('synced');
-              return prevMetrics;
             }
+            return prevMetrics;
           });
         }
+
+        if (status === 'synced' || status === 'failed') {
+          setLiveSyncState('synced');
+        } else {
+          setLiveSyncState('syncing');
+        }
+
       } catch (error) {
         console.error('Live sync error:', error);
       }
@@ -281,6 +283,11 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
   }, []);
+
+  const isCalculatingScore = liveSyncState === 'syncing';
+  const scoreColorClass = isCalculatingScore 
+    ? 'text-[#00E0FF] drop-shadow-[0_0_8px_rgba(0,224,255,0.5)]' 
+    : getRiskGlowColor(dashboardMetrics.riskScore);
 
   return (
     <main className="relative w-screen h-screen bg-[#0A0A0C] text-slate-200 overflow-hidden font-sans selection:bg-[#00E0FF] selection:text-black">
@@ -388,9 +395,13 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
               </div>
             </div>
             
-            <div className="p-8 text-center border-b border-white/5">
-              <div className={`text-6xl font-bold font-mono tracking-tighter transition-colors duration-1000 ${getRiskGlowColor(dashboardMetrics.riskScore)}`}>
-                {dashboardMetrics.riskScore}
+            <div className="p-8 text-center border-b border-white/5 flex flex-col justify-center h-36">
+              <div className={`transition-colors duration-1000 flex justify-center items-center h-16 ${scoreColorClass}`}>
+                {isCalculatingScore ? (
+                  <span className="text-xl font-mono tracking-widest animate-pulse">CALCULATING...</span>
+                ) : (
+                  <span className="text-6xl font-bold font-mono tracking-tighter">{dashboardMetrics.riskScore}</span>
+                )}
               </div>
               <div className="text-[10px] tracking-widest text-slate-500 mt-3 uppercase">Computed Risk Score</div>
             </div>
@@ -424,8 +435,11 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
           <div className="flex items-center gap-3 mb-3 text-xs font-mono text-slate-300">
             <span className="w-3 h-3 rounded-full bg-[#00E0FF] border-2 border-white shadow-[0_0_8px_#00E0FF]"></span> Target Subject
           </div>
-          <div className="flex items-center gap-3 text-xs font-mono text-slate-300">
+          <div className="flex items-center gap-3 mb-3 text-xs font-mono text-slate-300">
             <span className="w-3 h-3 rounded-full bg-slate-500/60 border-2 border-[#FF003C] shadow-[0_0_8px_rgba(255,0,60,0.8)]"></span> AI High Risk
+          </div>
+          <div className="flex items-center gap-3 mb-3 text-xs font-mono text-slate-300">
+            <span className="w-3 h-3 rounded-full border-2 border-[#B58900]" style={{ shapeOutside: 'polygon(30% 0%, 70% 0%, 100% 30%, 100% 70%, 70% 100%, 30% 100%, 0% 70%, 0% 30%)', clipPath: 'polygon(30% 0%, 70% 0%, 100% 30%, 100% 70%, 70% 100%, 30% 100%, 0% 70%, 0% 30%)' }}></span> Cross-Chain Bridge
           </div>
         </div>
       </div>
@@ -438,13 +452,6 @@ const renderTopology = useCallback((elements: GraphElement[]) => {
           <div className="font-mono text-[#00E0FF] tracking-[0.2em] text-sm animate-pulse">
             {analysisMode === 'trace' ? 'TRACING ILLICIT FLOWS...' : 'SCANNING LEDGER...'}
           </div>
-        </div>
-      )}
-
-      {!hasTopologyData && !isAnalyzing && (
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center pointer-events-none opacity-20">
-          <Layers size={64} className="mb-6 text-slate-400" />
-          <div className="font-mono tracking-[0.4em] text-sm font-bold text-slate-400">SYSTEM IDLE</div>
         </div>
       )}
     </main>

@@ -30,11 +30,10 @@ func (h *ForensicsHandler) Analyze(c *gin.Context) {
 	targetAddress := strings.ToLower(strings.TrimSpace(payload.Address))
 
 	if len(targetAddress) != 42 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "BROAD 模式只支援錢包地址 (42字元)。欲追蹤交易哈希，請切換至 FLOW 模式。"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "BROAD 模式只支援錢包地址。追蹤交易請使用 FLOW 模式。"})
 		return
 	}
 
-	// 💡 將解析出的 StartTime 與 EndTime 往下傳遞給大腦
 	count, err := h.analyzer.Analyze(c.Request.Context(), targetAddress, payload.StartTime, payload.EndTime)
 	if err != nil {
 		if count == 0 {
@@ -77,7 +76,6 @@ func (h *ForensicsHandler) GetGraph(c *gin.Context) {
 		return
 	}
 
-	// 💡 從 Query String 提取時間參數 (Get 請求的特性)
 	startTime, _ := strconv.ParseInt(c.Query("start"), 10, 64)
 	endTime, _ := strconv.ParseInt(c.Query("end"), 10, 64)
 
@@ -87,5 +85,10 @@ func (h *ForensicsHandler) GetGraph(c *gin.Context) {
 		return
 	}
 	
-	c.JSON(http.StatusOK, graphElements)
+	currentStatus := h.analyzer.GetStatus(c.Request.Context(), targetAddress)
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":   currentStatus,
+		"elements": graphElements,
+	})
 }

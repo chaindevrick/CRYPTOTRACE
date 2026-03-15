@@ -20,6 +20,7 @@ type AIRepository interface {
 
 type AnalyzerUsecase interface {
 	Analyze(ctx context.Context, address string, startTime, endTime int64) (int, error)
+	GetStatus(ctx context.Context, address string) string 
 }
 
 type TracerUsecase interface {
